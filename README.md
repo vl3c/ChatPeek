@@ -25,7 +25,7 @@ all_replies = chat.conversation
 print(chat.title)
 print(f"{datetime.datetime.fromtimestamp(chat.date)} | {chat.ai_model}\n")
 for reply in all_replies:
-    print(f"{reply.name} ({str(reply.type).split('.')[1]}):\n{reply.statement}\n")
+    print(f"{reply.author_name} ({str(reply.type).split('.')[1]}):\n{reply.statement}\n")
 ```
 
 ## Testing

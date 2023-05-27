@@ -15,7 +15,7 @@ class Reply:
     Reply class represents a reply in the chat.
     """
     def __init__(self, author: str, type: ReplyType, statement: str):
-        self.name = author
+        self.author_name = author
         self.type = type
         self.statement = statement
 

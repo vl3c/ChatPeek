@@ -17,7 +17,7 @@ class TestChatPeek(unittest.TestCase):
         self.assertGreater(len(chat.conversation), 0)
         for reply in chat.conversation:
             self.assertIsInstance(reply, Reply)
-            self.assertIsNotNone(reply.name)
+            self.assertIsNotNone(reply.author_name)
             self.assertIsNotNone(reply.statement)
     
     def test_chat_peek_content(self):
@@ -26,7 +26,7 @@ class TestChatPeek(unittest.TestCase):
         all_replies = chat.conversation
         s = f"{chat.title} | {datetime.fromtimestamp(chat.date)} | {chat.ai_model}\n"
         for reply in all_replies:
-            s += f"{reply.name} ({str(reply.type).split('.')[1]}): {reply.statement}\n"
+            s += f"{reply.author_name} ({str(reply.type).split('.')[1]}): {reply.statement}\n"
         self.assertMultiLineEqual(s, validation_text)
 
 if __name__ == '__main__':
