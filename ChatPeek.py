@@ -82,8 +82,8 @@ class ChatPeek:
             response = requests.get(self.__link)
             response.raise_for_status()  # Raise an exception if the request was unsuccessful
         except requests.RequestException as e:
-            print(f"Failed to download content: {e}")
-            return ""
+            print(f'Failed to download content: {e}')
+            return ''
 
         soup = BeautifulSoup(response.text, 'html.parser')
         script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
@@ -91,29 +91,28 @@ class ChatPeek:
 
     def __parse_content(self, content: str) -> List[Reply]:
         try:
-            data = json.loads(content)
+            data = json.loads(content)['props']['pageProps']['serverResponse']['data']
         except json.JSONDecodeError as e:
-            print(f"Failed to parse JSON: {e}")
-            return "", []
-        update_time = data['props']['pageProps']['serverResponse']['data']['update_time']
-        ai_model = data['props']['pageProps']['serverResponse']['data']['model']['slug']
-        ai_tags = data['props']['pageProps']['serverResponse']['data']['model'].get('tags', [])
+            print(f'Failed to parse JSON: {e}')
+            return '', []
+        update_time = data['update_time']
+        ai_model = data['model']['slug']
+        ai_tags = data['model'].get('tags', [])
         ai_name = next((s for s in ai_tags if s.startswith('gpt')), 'GPT').upper()
         try:
-            author_name = data['props']['pageProps']['serverResponse']['data']['author_name']
+            author_name = data['author_name']
         except KeyError:
-            author_name = "User"
-        title = data['props']['pageProps']['serverResponse']['data'].get('title', "")
-        conversation_mapping = data['props']['pageProps']['serverResponse']['data'].get('mapping', {})
+            author_name = 'User'
+        title = data.get('title', '')
+        conversation = data.get('linear_conversation', [])
         replies = []
-        for key, message in conversation_mapping.items():
+        for reply in conversation:
             try:
-                reply_text = ''.join(message['message']['content']['parts'])
-                if message['message']['author']['role'] == 'user':
+                reply_text = ' '.join(reply['message']['content']['parts'])
+                if reply['message']['author']['role'] == 'user':
                     replies.append(Reply(author_name, ReplyType.HUMAN, reply_text))
-                elif message['message']['author']['role'] == 'assistant':
+                elif reply['message']['author']['role'] == 'assistant':
                     replies.append(Reply(ai_name, ReplyType.AI, reply_text))
             except KeyError:
                 continue
-        replies = list(reversed(replies))
         return ai_model, author_name, update_time, title, replies
