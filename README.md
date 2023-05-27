@@ -44,16 +44,16 @@ Contributions are welcome! Please submit a pull request or create an issue to di
 
 This project is licensed under the MIT License.
 
-## Classes (to be expanded)
+## Classes
 
 ### ReplyType
 An Enum for specifying the type of reply, either `HUMAN` or `AI`.
 
 ### Reply
-Represents a single reply in a conversation, with a name (either "User" or "AI"), a reply type, and the statement content.
+Represents a single reply in a conversation, with a author names (if public), a reply type, and the statement content.
 
 ### Chat
-Represents a full chat conversation, with a title and a list of `Reply` objects.
+Represents a full chat conversation, with a timestamp, user name, AI model, a title and a list of `Reply` objects.
 
 ### ChatPeek
 The main class that takes a ChatGPT shared conversation link and parses it into a `Chat` object. 
