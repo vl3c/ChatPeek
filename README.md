@@ -28,7 +28,7 @@ for index, reply in enumerate(all_replies, start=1):
 
 ## Testing
 
-Unit tests are provided in `test_chat_peek.py`. To run the tests, use the following command:
+Unit tests are provided in `ChatPeek_test.py`. To run the tests, use the following command:
 
 ```bash
 python -m unittest ChatPeek_test.py
