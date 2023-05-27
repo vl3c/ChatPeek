@@ -14,16 +14,16 @@ ChatPeek is a Python utility for parsing shared conversation links from OpenAI's
 First, instantiate a `ChatPeek` object with a shared conversation link as an argument. Then, access the `Chat` object via the `Chat` property of the `ChatPeek` object:
 
 ```python
-chat = ChatPeek("your_shared_conversation_link_here").Chat
+chat = ChatPeek("your_shared_conversation_link_here").chat
 ```
 
 You can then access the conversation title, all replies, and specific replies:
 
 ```python
-all_replies = chat.Conversation
-print(chat.Title)
-print(all_replies[0].Statement)
-print(all_replies[1].Statement)
+all_replies = chat.conversation
+print(chat.title)
+for index, reply in enumerate(all_replies, start=1):
+    print(f"{index}. {reply.name} ({str(reply.type).split('.')[1]}): {reply.statement}")
 ```
 
 ## Testing

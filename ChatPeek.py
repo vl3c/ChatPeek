@@ -14,9 +14,9 @@ class Reply:
     """
     Reply class represents a reply in the chat.
     """
-    def __init__(self, name: str, reply_type: ReplyType, statement: str):
+    def __init__(self, name: str, type: ReplyType, statement: str):
         self.name = name
-        self.reply_type = reply_type
+        self.type = type
         self.statement = statement
 
 
@@ -38,11 +38,11 @@ class Chat:
 
     @property
     def human_replies(self) -> List[Reply]:
-        return [reply for reply in self.__replies if reply.reply_type == ReplyType.HUMAN]
+        return [reply for reply in self.__replies if reply.type == ReplyType.HUMAN]
 
     @property
     def ai_replies(self) -> List[Reply]:
-        return [reply for reply in self.__replies if reply.reply_type == ReplyType.AI]
+        return [reply for reply in self.__replies if reply.type == ReplyType.AI]
 
 
 class ChatPeek:
@@ -90,7 +90,7 @@ class ChatPeek:
                 if message['message']['author']['role'] == 'user':
                     replies.append(Reply("User", ReplyType.HUMAN, reply_text))
                 elif message['message']['author']['role'] == 'assistant':
-                    replies.append(Reply("AI", ReplyType.AI, reply_text))
+                    replies.append(Reply("GPT", ReplyType.AI, reply_text))
             except KeyError:
                 continue
         replies = list(reversed(replies))
