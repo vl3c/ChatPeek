@@ -14,8 +14,8 @@ class Reply:
     """
     Reply class represents a reply in the chat.
     """
-    def __init__(self, name: str, type: ReplyType, statement: str):
-        self.name = name
+    def __init__(self, author: str, type: ReplyType, statement: str):
+        self.name = author
         self.type = type
         self.statement = statement
 
@@ -24,9 +24,24 @@ class Chat:
     """
     Chat class represents a chat.
     """
-    def __init__(self, title: str, replies: List[Reply]):
+    def __init__(self, ai_model: str, username: str, date: int, title: str, replies: List[Reply]):
+        self.__ai_model = ai_model
+        self.__username = username
+        self.__date = date
         self.__title = title
         self.__replies = replies
+    
+    @property
+    def ai_model(self) -> str:
+        return self.__ai_model
+    
+    @property
+    def username(self) -> str:
+        return self.__username
+
+    @property
+    def date(self) -> str:
+        return self.__date
 
     @property
     def title(self) -> str:
@@ -59,8 +74,8 @@ class ChatPeek:
 
     def __parse_link(self) -> Chat:
         content = self.__download_content()
-        title, replies = self.__parse_content(content)
-        return Chat(title, replies)
+        ai_model, username, date, title, replies = self.__parse_content(content)
+        return Chat(ai_model, username, date, title, replies)
 
     def __download_content(self) -> str:
         try:
@@ -80,7 +95,14 @@ class ChatPeek:
         except json.JSONDecodeError as e:
             print(f"Failed to parse JSON: {e}")
             return "", []
-
+        update_time = data['props']['pageProps']['serverResponse']['data']['update_time']
+        ai_model = data['props']['pageProps']['serverResponse']['data']['model']['slug']
+        ai_tags = data['props']['pageProps']['serverResponse']['data']['model'].get('tags', [])
+        ai_name = next((s for s in ai_tags if s.startswith('gpt')), 'GPT').upper()
+        try:
+            author_name = data['props']['pageProps']['serverResponse']['data']['author_name']
+        except KeyError:
+            author_name = "User"
         title = data['props']['pageProps']['serverResponse']['data'].get('title', "")
         conversation_mapping = data['props']['pageProps']['serverResponse']['data'].get('mapping', {})
         replies = []
@@ -88,10 +110,10 @@ class ChatPeek:
             try:
                 reply_text = ''.join(message['message']['content']['parts'])
                 if message['message']['author']['role'] == 'user':
-                    replies.append(Reply("User", ReplyType.HUMAN, reply_text))
+                    replies.append(Reply(author_name, ReplyType.HUMAN, reply_text))
                 elif message['message']['author']['role'] == 'assistant':
-                    replies.append(Reply("GPT", ReplyType.AI, reply_text))
+                    replies.append(Reply(ai_name, ReplyType.AI, reply_text))
             except KeyError:
                 continue
         replies = list(reversed(replies))
-        return title, replies
+        return ai_model, author_name, update_time, title, replies
