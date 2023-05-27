@@ -1,6 +1,6 @@
 # ChatPeek - a ChatGPT shared conversation link parser
 
-ChatPeek is a Python utility for parsing shared conversation links from OpenAI's ChatGPT. It allows users to easily analyze, process and work with conversations.
+ChatPeek is a Python utility for parsing shared conversation links from OpenAI's ChatGPT. It allows users to easily analyze, process and work with public human-AI conversations.
 
 ## Features
 
