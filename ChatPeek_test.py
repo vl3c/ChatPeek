@@ -120,6 +120,25 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].asset_type, "file")
 
+    def test_flatten_message_content_non_downloadable_pointer_adds_note(self):
+        message = {
+            "id": "msg-asset",
+            "content": {
+                "content_type": "multimodal_text",
+                "parts": [
+                    {
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": "sediment://file_123",
+                    }
+                ],
+            },
+            "metadata": {},
+        }
+        text, assets = flatten_message_content("msg-asset", message["content"], message)
+        self.assertIn("not included in export", text)
+        self.assertEqual(len(assets), 1)
+        self.assertFalse(assets[0].downloadable)
+
     def test_slugify_title_includes_share_suffix(self):
         slug = slugify_title("Gigawatt Data Centers", "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertTrue(slug.startswith("gigawatt-data-centers"))

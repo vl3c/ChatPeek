@@ -47,6 +47,7 @@ class ConversationAsset:
     url: str
     filename: str
     description: Optional[str] = None
+    downloadable: bool = True
 
 
 @dataclass
@@ -132,7 +133,7 @@ class Chat:
                     target_path = target_dir / asset.filename
                     if target_path.exists():
                         continue
-                    if not asset.url.lower().startswith("http"):
+                    if not asset.downloadable or not asset.url or not asset.url.lower().startswith("http"):
                         continue
                     fetch = http_get or default_http_get
                     resp = fetch(asset.url)
@@ -359,9 +360,22 @@ def flatten_message_content(
     content_type = content.get("content_type")
     assets: List[ConversationAsset] = []
 
+    def render_asset_reference(asset: ConversationAsset) -> str:
+        relative_dir = "images" if asset.asset_type == "image" else "attachments"
+        rel_path = Path(relative_dir) / asset.filename
+        if asset.downloadable:
+            if asset.asset_type == "image":
+                return f"![{asset.filename}]({rel_path.as_posix()})"
+            return f"[{asset.filename}]({rel_path.as_posix()})"
+        label = asset.description or asset.filename
+        source = asset.url or "unavailable source"
+        kind = "Image" if asset.asset_type == "image" else "Attachment"
+        return f"*{kind} '{label}' not included in export (source: {source}).*"
+
     def finalize(text: str) -> Tuple[str, List[ConversationAsset]]:
         metadata = message.get("metadata") or {}
         attachment_lines: List[str] = []
+
         for attachment in metadata.get("attachments", []):
             url = attachment.get("download_url") or attachment.get("file_url")
             if not url:
@@ -369,20 +383,17 @@ def flatten_message_content(
             mime = attachment.get("mime_type")
             filename = attachment.get("name") or build_asset_filename(message_id, len(assets), mime)
             asset_type = attachment.get("file_type") or attachment.get("type") or "file"
+            downloadable = bool(url and url.lower().startswith("http"))
             assets.append(
                 ConversationAsset(
                     asset_type="image" if "image" in (asset_type or "").lower() else "file",
                     url=url,
                     filename=filename,
                     description=attachment.get("title") or attachment.get("name"),
+                    downloadable=downloadable,
                 )
             )
-            relative_dir = "images" if assets[-1].asset_type == "image" else "attachments"
-            rel_path = Path(relative_dir) / filename
-            if assets[-1].asset_type == "image":
-                attachment_lines.append(f"![{filename}]({rel_path.as_posix()})")
-            else:
-                attachment_lines.append(f"[{filename}]({rel_path.as_posix()})")
+            attachment_lines.append(render_asset_reference(assets[-1]))
         combined = text.strip()
         if attachment_lines:
             combined = (combined + "\n\n" if combined else "") + "\n".join(attachment_lines)
@@ -450,19 +461,17 @@ def flatten_message_content(
                 elif p_type in {"image_asset_pointer", "file"} and part.get("asset_pointer"):
                     filename = build_asset_filename(message_id, len(assets), part.get("mime_type"))
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
+                    pointer = part.get("asset_pointer")
+                    downloadable = bool(pointer and pointer.lower().startswith("http"))
                     assets.append(
                         ConversationAsset(
                             asset_type=asset_type,
-                            url=part["asset_pointer"],
+                            url=pointer,
                             filename=filename,
+                            downloadable=downloadable,
                         )
                     )
-                    relative_dir = "images" if asset_type == "image" else "attachments"
-                    rel_path = Path(relative_dir) / filename
-                    if asset_type == "image":
-                        segments.append(f"![{filename}]({rel_path.as_posix()})")
-                    else:
-                        segments.append(f"[{filename}]({rel_path.as_posix()})")
+                    segments.append(render_asset_reference(assets[-1]))
         return finalize("\n\n".join(segment.strip() for segment in segments if segment.strip()))
 
     if content_type == "tool_response":
