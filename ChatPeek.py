@@ -458,11 +458,14 @@ def flatten_message_content(
                         segments.extend(strip_private_use(t) for t in texts)
                     elif isinstance(texts, str):
                         segments.append(strip_private_use(texts))
-                elif p_type in {"image_asset_pointer", "file"} and part.get("asset_pointer"):
+                elif p_type in {"image_asset_pointer", "file"}:
+                    pointer_raw = part.get("asset_pointer")
+                    if not isinstance(pointer_raw, str) or not pointer_raw:
+                        continue
                     filename = build_asset_filename(message_id, len(assets), part.get("mime_type"))
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
-                    pointer = part.get("asset_pointer")
-                    downloadable = bool(pointer and pointer.lower().startswith("http"))
+                    pointer = pointer_raw
+                    downloadable = pointer.lower().startswith("http")
                     assets.append(
                         ConversationAsset(
                             asset_type=asset_type,
