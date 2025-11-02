@@ -373,7 +373,25 @@ def flatten_message_content(
         return combined, assets
 
     if content_type == "text":
-        parts = [strip_private_use(part).strip("\n") for part in content.get("parts", []) if part]
+        parsed_parts: List[str] = []
+        for part in content.get("parts", []):
+            if not part:
+                continue
+            cleaned = strip_private_use(part).strip("\n")
+            parsed = cleaned
+            if cleaned.startswith("{") and cleaned.endswith("}"):
+                try:
+                    maybe_json = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    maybe_json = None
+                if isinstance(maybe_json, dict):
+                    response = maybe_json.get("response")
+                    if isinstance(response, str):
+                        parsed = response
+                    else:
+                        parsed = maybe_json.get("content") or cleaned
+            parsed_parts.append(parsed)
+        parts = parsed_parts
         return finalize("\n\n".join(part for part in parts if part))
 
     if content_type == "code":

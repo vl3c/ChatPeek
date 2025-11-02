@@ -84,6 +84,21 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].filename, "file.txt")
 
+    def test_flatten_message_content_parses_structured_json(self):
+        message = {
+            "id": "json",
+            "content": {
+                "content_type": "text",
+                "parts": [
+                    "{\n  \"task_violates_safety_guidelines\": false,\n  \"response\": \"Only include this text\",\n  \"prompt\": \"Ignore this\"\n}"
+                ],
+            },
+            "metadata": {},
+        }
+        text, assets = flatten_message_content("json", message["content"], message)
+        self.assertEqual(text, "Only include this text")
+        self.assertEqual(assets, [])
+
     def test_flatten_message_content_multimodal_file_pointer(self):
         message = {
             "id": "msg-1234",
