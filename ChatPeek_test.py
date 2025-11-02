@@ -84,6 +84,26 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].filename, "file.txt")
 
+    def test_flatten_message_content_multimodal_file_pointer(self):
+        message = {
+            "id": "msg-1234",
+            "content": {
+                "content_type": "multimodal_text",
+                "parts": [
+                    {
+                        "content_type": "file",
+                        "asset_pointer": "https://example.com/asset.bin",
+                        "mime_type": "application/pdf",
+                    }
+                ],
+            },
+            "metadata": {},
+        }
+        text, assets = flatten_message_content("msg-1234", message["content"], message)
+        self.assertIn("[msg-0.pdf](attachments/msg-0.pdf)", text)
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(assets[0].asset_type, "file")
+
     def test_slugify_title_includes_share_suffix(self):
         slug = slugify_title("Gigawatt Data Centers", "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertTrue(slug.startswith("gigawatt-data-centers"))
@@ -148,7 +168,7 @@ class ChatPeekModuleTests(unittest.TestCase):
             path = Path(tmp)
             md_path = chat.save_markdown(path, download_assets=False)
             self.assertTrue(md_path.exists())
-            self.assertTrue(md_path.read_text())
+            self.assertTrue(md_path.read_text(encoding="utf-8"))
 
     @mock.patch("ChatPeek.fetch_share_page")
     def test_chatpeek_constructs_chat_once(self, mock_fetch):

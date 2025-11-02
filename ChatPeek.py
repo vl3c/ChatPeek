@@ -415,15 +415,20 @@ def flatten_message_content(
                         segments.append(strip_private_use(texts))
                 elif p_type in {"image_asset_pointer", "file"} and part.get("asset_pointer"):
                     filename = build_asset_filename(message_id, len(assets), part.get("mime_type"))
+                    asset_type = "image" if "image" in (p_type or "").lower() else "file"
                     assets.append(
                         ConversationAsset(
-                            asset_type="image" if "image" in p_type else "file",
+                            asset_type=asset_type,
                             url=part["asset_pointer"],
                             filename=filename,
                         )
                     )
-                    rel_path = Path("images") / filename
-                    segments.append(f"![asset]({rel_path.as_posix()})")
+                    relative_dir = "images" if asset_type == "image" else "attachments"
+                    rel_path = Path(relative_dir) / filename
+                    if asset_type == "image":
+                        segments.append(f"![{filename}]({rel_path.as_posix()})")
+                    else:
+                        segments.append(f"[{filename}]({rel_path.as_posix()})")
         return finalize("\n\n".join(segment.strip() for segment in segments if segment.strip()))
 
     if content_type == "tool_response":
