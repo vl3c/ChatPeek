@@ -1,8 +1,9 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Mapping, cast
 from unittest import mock
 
 import requests
@@ -19,6 +20,8 @@ from ChatPeek import (
     parse_modern_share,
     parse_share_html,
     slugify_title,
+    strip_private_use,
+    strip_citation_tokens,
 )
 
 
@@ -217,6 +220,30 @@ class ChatPeekModuleTests(unittest.TestCase):
         markdown = chat.to_markdown()
         self.assertIn("| Project | Location", markdown)
 
+    def test_chat_markdown_has_no_citation_tokens(self) -> None:
+        chat = parse_modern_share(self.html)
+        markdown = chat.to_markdown()
+        self.assertNotIn("citeturn", markdown)
+
+    def test_chat_markdown_has_no_response_length_blobs(self) -> None:
+        chat = parse_modern_share(self.html)
+        markdown = chat.to_markdown()
+        self.assertNotIn("response_length", markdown)
+
+    def test_chat_markdown_summarizes_tool_queries(self) -> None:
+        chat = parse_modern_share(self.html)
+        markdown = chat.to_markdown()
+        self.assertIn("Search tool invoked with queries:", markdown)
+
+    def test_markdown_preserves_useful_content(self) -> None:
+        chat = parse_modern_share(self.html)
+        markdown = chat.to_markdown()
+        raw_segments = self._collect_useful_segments(self.html)
+        normalized_markdown = self._normalize(markdown)
+        for segment in raw_segments:
+            with self.subTest(segment=segment):
+                self.assertIn(self._normalize(segment), normalized_markdown)
+
     def test_chat_save_markdown_creates_file(self) -> None:
         chat = parse_modern_share(self.html)
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,6 +258,107 @@ class ChatPeekModuleTests(unittest.TestCase):
         instance = ChatPeek("https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertIsInstance(instance.chat, Chat)
         mock_fetch.assert_called_once()
+
+    def _collect_useful_segments(self, html: str) -> List[str]:
+        payload = extract_loader_payload(html)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        decoded = decode_loader(payload)
+        loader_data = cast(Dict[str, Any], decoded.get("loaderData", {}))
+        route = cast(Dict[str, Any], loader_data.get("routes/share.$shareId.($action)", {}))
+        server_response = cast(Dict[str, Any], route.get("serverResponse", {}))
+        data = cast(Dict[str, Any], server_response.get("data", {}))
+        mapping = cast(Dict[str, Any], data.get("mapping", {}))
+        sequence = cast(List[Dict[str, Any]], data.get("linear_conversation", []))
+        segments: List[str] = []
+
+        for entry in sequence:
+            node_id = entry.get("id") if isinstance(entry, Mapping) else None
+            if not isinstance(node_id, str):
+                continue
+            node = mapping.get(node_id)
+            if not isinstance(node, Mapping):
+                continue
+            message = node.get("message")
+            if not isinstance(message, Mapping):
+                continue
+            content = message.get("content")
+            if not isinstance(content, Mapping):
+                continue
+            ctype = content.get("content_type")
+            if ctype == "text":
+                parts = content.get("parts", [])
+                if isinstance(parts, list):
+                    for part in parts:
+                        if isinstance(part, str):
+                            cleaned = strip_private_use(part).strip()
+                            cleaned = self._clean_segment(cleaned)
+                            if cleaned:
+                                segments.append(cleaned)
+            elif ctype == "code":
+                text = content.get("text")
+                if isinstance(text, str):
+                    try:
+                        maybe_json = json.loads(text)
+                    except json.JSONDecodeError:
+                        maybe_json = None
+                    if isinstance(maybe_json, Mapping):
+                        search_queries = maybe_json.get("search_query")
+                        if isinstance(search_queries, list):
+                            for entry in search_queries:
+                                if isinstance(entry, Mapping):
+                                    query = entry.get("q")
+                                    if isinstance(query, str) and query.strip():
+                                        cleaned_query = self._clean_segment(query.strip())
+                                        if cleaned_query:
+                                            segments.append(cleaned_query)
+                                elif isinstance(entry, str) and entry.strip():
+                                    cleaned_entry = self._clean_segment(entry.strip())
+                                    if cleaned_entry:
+                                        segments.append(cleaned_entry)
+                        continue
+                    if text.strip():
+                        cleaned_text = self._clean_segment(text.strip())
+                        if cleaned_text:
+                            segments.append(cleaned_text)
+            elif ctype == "multimodal_text":
+                parts = content.get("parts", [])
+                if isinstance(parts, list):
+                    for part in parts:
+                        if isinstance(part, str):
+                            cleaned = strip_private_use(part).strip()
+                            cleaned = self._clean_segment(cleaned)
+                            if cleaned:
+                                segments.append(cleaned)
+                        elif isinstance(part, Mapping):
+                            inner_text = part.get("text")
+                            if isinstance(inner_text, list):
+                                for piece in inner_text:
+                                    if isinstance(piece, str):
+                                        cleaned_piece = strip_private_use(piece).strip()
+                                        if cleaned_piece:
+                                            piece_cleaned = self._clean_segment(cleaned_piece)
+                                            if piece_cleaned:
+                                                segments.append(piece_cleaned)
+                            elif isinstance(inner_text, str):
+                                cleaned_piece = strip_private_use(inner_text).strip()
+                                if cleaned_piece:
+                                    piece_cleaned = self._clean_segment(cleaned_piece)
+                                    if piece_cleaned:
+                                        segments.append(piece_cleaned)
+        return segments
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return " ".join(text.split())
+
+    @staticmethod
+    def _clean_segment(text: str) -> str:
+        cleaned = strip_citation_tokens(text)
+        cleaned = re.sub(r"navlist[^\s]*", "", cleaned)
+        cleaned = cleaned.replace("citeturn", "")
+        cleaned = cleaned.strip()
+        return cleaned
 
 
 if __name__ == "__main__":

@@ -445,10 +445,60 @@ def author_name_for_role(role: Optional[str]) -> str:
 
 
 PRIVATE_USE_PATTERN = re.compile("[\uE000-\uF8FF]")
+CITATION_TOKEN_PATTERN = re.compile(r"\s*(?:citeturn|navlist|turn\d+\w*)[^,\s]*,?")
+
+
+def summarize_tool_payload(data: Mapping[str, Any]) -> Optional[str]:
+    lines: List[str] = []
+
+    search_queries = data.get("search_query")
+    queries: List[str] = []
+    if isinstance(search_queries, list):
+        for entry in search_queries:
+            if isinstance(entry, Mapping):
+                query = entry.get("q")
+                if isinstance(query, str):
+                    query = query.strip()
+                    if query:
+                        queries.append(query)
+            elif isinstance(entry, str):
+                query = entry.strip()
+                if query:
+                    queries.append(query)
+    if queries:
+        lines.append("Search tool invoked with queries:")
+        lines.extend(f"- {query}" for query in queries)
+
+    additional_items: List[str] = []
+    for key, value in data.items():
+        if key in {"search_query", "response_length"}:
+            continue
+        if isinstance(value, (str, int, float)):
+            value_str = str(value).strip()
+            if value_str:
+                additional_items.append(f"{key}: {value_str}")
+    if additional_items:
+        if not lines:
+            lines.append("Tool parameters:")
+        lines.extend(f"- {item}" for item in additional_items)
+
+    if lines:
+        return "\n".join(lines)
+    return None
 
 
 def strip_private_use(text: str) -> str:
     return PRIVATE_USE_PATTERN.sub("", text)
+
+
+def strip_citation_tokens(text: str) -> str:
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        cleaned = CITATION_TOKEN_PATTERN.sub("", line).rstrip()
+        cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines)
 
 
 def flatten_message_content(
@@ -512,6 +562,7 @@ def flatten_message_content(
         combined = text.strip()
         if attachment_lines:
             combined = (combined + "\n\n" if combined else "") + "\n".join(attachment_lines)
+        combined = strip_citation_tokens(combined)
         return combined, assets
 
     if content_type == "text":
@@ -522,18 +573,19 @@ def flatten_message_content(
                 if not isinstance(part, str):
                     continue
                 cleaned = strip_private_use(part).strip("\n")
-            parsed = cleaned
-            if cleaned.startswith("{") and cleaned.endswith("}"):
-                try:
-                    maybe_json = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    maybe_json = None
-                if isinstance(maybe_json, dict):
-                    response = maybe_json.get("response")
-                    if isinstance(response, str):
-                        parsed = response
-                    else:
-                        parsed = maybe_json.get("content") or cleaned
+                parsed = cleaned
+                if cleaned.startswith("{") and cleaned.endswith("}"):
+                    try:
+                        maybe_json = json.loads(cleaned)
+                    except json.JSONDecodeError:
+                        maybe_json = None
+                    if isinstance(maybe_json, dict):
+                        response = maybe_json.get("response")
+                        if isinstance(response, str):
+                            parsed = response
+                        else:
+                            fallback = maybe_json.get("content")
+                            parsed = fallback if isinstance(fallback, str) else cleaned
                 parsed_parts.append(parsed)
         parts = parsed_parts
         return finalize("\n\n".join(part for part in parts if part))
@@ -544,6 +596,23 @@ def flatten_message_content(
         lang = language if isinstance(language, str) and language != "unknown" else ""
         text_body = code_text if isinstance(code_text, str) else ""
         body = text_body.rstrip("\n")
+        if body:
+            try:
+                maybe_json = json.loads(body)
+            except json.JSONDecodeError:
+                maybe_json = None
+            if isinstance(maybe_json, Mapping):
+                summary = summarize_tool_payload(maybe_json)
+                if summary is not None:
+                    return finalize(summary)
+                cleaned_dict = {
+                    key: value
+                    for key, value in maybe_json.items()
+                    if key != "response_length"
+                }
+                if not cleaned_dict:
+                    return finalize("")
+                body = json.dumps(cleaned_dict, indent=2, ensure_ascii=False)
         return finalize(f"```{lang}\n{body}\n```")
 
     if content_type == "thoughts":
