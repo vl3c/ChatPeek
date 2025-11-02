@@ -16,6 +16,7 @@ from ChatPeek import (
     parse_modern_share,
     parse_share_html,
     slugify_title,
+    ShareAccessError,
 )
 
 
@@ -171,6 +172,19 @@ class ChatPeekModuleTests(unittest.TestCase):
         args, kwargs = mock_get.call_args
         self.assertIn("Referer", kwargs["headers"])
         self.assertTrue(kwargs["headers"]["User-Agent"].startswith("Mozilla"))
+
+    @mock.patch("requests.get")
+    def test_fetch_share_page_private_chat_raises_share_access_error(self, mock_get):
+        mock_response = mock.Mock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.text = ""
+        mock_response.raise_for_status.side_effect = requests.HTTPError(response=mock_response)
+        mock_get.return_value = mock_response
+
+        with self.assertRaises(ShareAccessError) as ctx:
+            fetch_share_page("https://chatgpt.com/c/abcdef")
+
+        self.assertIn("private conversation", str(ctx.exception))
 
     def test_chat_to_markdown_includes_table(self):
         chat = parse_modern_share(self.html)

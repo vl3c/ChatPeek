@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -140,6 +142,10 @@ class Chat:
         return markdown_path
 
 
+class ShareAccessError(RuntimeError):
+    """Raised when a share URL cannot be fetched due to access restrictions."""
+
+
 def default_http_get(url: str) -> requests.Response:
     return requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
 
@@ -151,7 +157,17 @@ def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout
     if headers:
         merged_headers.update(headers)
     response = requests.get(url, headers=merged_headers, timeout=timeout)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        if response.status_code == 403 and parsed.netloc.endswith("chatgpt.com") and path.startswith("/c/"):
+            raise ShareAccessError(
+                "The provided link appears to be a private conversation. "
+                "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
+            ) from exc
+        raise
     return response.text
 
 
@@ -505,7 +521,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    html = fetch_share_page(args.share_url)
+    try:
+        html = fetch_share_page(args.share_url)
+    except ShareAccessError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     chat = parse_share_html(html)
     markdown_path = chat.save_markdown(args.output, download_assets=not args.skip_assets)
     print(markdown_path)
