@@ -9,12 +9,12 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import requests
-from bs4 import BeautifulSoup
+import requests  # type: ignore[import]
 
 
 DEFAULT_HEADERS = {
@@ -31,6 +31,43 @@ DEFAULT_HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+EXPORT_ROOT = Path("Exports")
+
+
+class _ScriptCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_script = False
+        self._current_attrs: Dict[str, str] = {}
+        self._current_data: List[str] = []
+        self.scripts: List[Tuple[Dict[str, str], str]] = []
+
+    def handle_starttag(self, tag: str, attrs):
+        if tag.lower() == "script":
+            self._in_script = True
+            self._current_attrs = {name: (value or "") for name, value in attrs}
+            self._current_data = []
+
+    def handle_endtag(self, tag: str):
+        if tag.lower() == "script" and self._in_script:
+            content = "".join(self._current_data)
+            self.scripts.append((self._current_attrs, content))
+            self._in_script = False
+            self._current_attrs = {}
+            self._current_data = []
+
+    def handle_data(self, data: str):
+        if self._in_script:
+            self._current_data.append(data)
+
+
+def _extract_scripts(html: str) -> List[Tuple[Dict[str, str], str]]:
+    parser = _ScriptCollector()
+    parser.feed(html)
+    parser.close()
+    return parser.scripts
 
 
 class ReplyType(Enum):
@@ -175,9 +212,7 @@ def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout
 def extract_loader_payload(html: str) -> Optional[List]:
     """Extract the React Flight loader payload if present."""
 
-    soup = BeautifulSoup(html, "html.parser")
-    for script in soup.find_all("script"):
-        text = script.string
+    for _attrs, text in _extract_scripts(html):
         if not text or "streamController.enqueue" not in text:
             continue
         start = 0
@@ -292,11 +327,15 @@ def parse_modern_share(html: str) -> Chat:
 
 
 def parse_legacy_share(html: str) -> Chat:
-    soup = BeautifulSoup(html, "html.parser")
-    script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not script_tag or not script_tag.string:
+    script_content: Optional[str] = None
+    for attrs, text in _extract_scripts(html):
+        if attrs.get("id") == "__NEXT_DATA__":
+            script_content = text
+            break
+
+    if not script_content:
         raise ValueError("Legacy share payload not found")
-    payload = json.loads(script_tag.string)
+    payload = json.loads(script_content)
     data = payload["props"]["pageProps"]["serverResponse"]["data"]
     share_id = data.get("conversation_id", "shared")
     model_slug = data.get("model", {}).get("slug", "")
@@ -523,7 +562,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("."),
+        default=EXPORT_ROOT,
         help="Destination directory for the exported conversation",
     )
     parser.add_argument(
