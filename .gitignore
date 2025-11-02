@@ -1,3 +1,8 @@
-__pycache__/ChatPeek_test.cpython-311.pyc
-__pycache__/ChatPeek.cpython-311.pyc
-.vscode/settings.json
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+
+.venv/
+.vscode/
+
+exports/

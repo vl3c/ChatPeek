@@ -1,59 +1,46 @@
-# ChatPeek - a ChatGPT shared conversation link parser
+# ChatPeek - export ChatGPT shares to Markdown
 
-ChatPeek is a Python utility for parsing shared conversation links from OpenAI's ChatGPT. It allows users to easily analyze, process and work with public human-AI conversations.
+ChatPeek downloads an individual `chatgpt.com/share/...` link (using the same headers a private browser tab would send), rebuilds the conversation offline, and turns it into clean Markdown. When the conversation points to downloadable assets (images, attachments), the exporter can create a conversation folder containing the Markdown plus the referenced files.
 
 ## Features
 
-- Fetches shared conversation content from a given link.
-- Parses the content into a structured format.
-- Classifies each message in the conversation as either human or AI.
-- Provides easy access to all replies in the conversation, as well as distinguishing between human and AI replies.
+- Single-request fetch with private-window style headers (no retry loop or backend probing)
+- React Flight parser for modern `chatgpt.com` shares with a legacy fallback for older `chat.openai.com` pages
+- Message normalisation that keeps Markdown tables, code blocks, thoughts, tool outputs, and attachment links
+- Markdown writer with optional asset download (`images/` and `attachments/` subfolders when needed)
+- Lightweight CLI: `python ChatPeek.py <share-url>` writes the Markdown to disk
 
-## Usage
+## Quick start
 
-First, instantiate a `ChatPeek` object with a shared conversation link as an argument. Then, access the `Chat` object via the `chat` property of the `ChatPeek` object:
-
-```python
-chat_peek = ChatPeek("your_shared_conversation_link_here") 
-chat = chat_peek.chat
+```bash
+python -m pip install -r requirements.txt  # requests + beautifulsoup4
+python ChatPeek.py https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2
+# -> ./gigawatt-data-centers-690781ed.md
 ```
 
-You can then access the conversation title, all replies, and specific replies:
+From Python you can orchestrate the export yourself:
 
 ```python
-all_replies = chat.conversation
-print(chat.title)
-print(f"{datetime.datetime.fromtimestamp(chat.date)} | {chat.ai_model}\n")
-for reply in all_replies:
-    print(f"{reply.author_name} ({str(reply.type).split('.')[1]}):\n{reply.statement}\n")
+from pathlib import Path
+from ChatPeek import ChatPeek
+
+peek = ChatPeek("https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2")
+markdown_path = peek.chat.save_markdown(Path("exports"), download_assets=True)
+print(markdown_path)
 ```
 
 ## Testing
 
-Unit tests are provided in `ChatPeek_test.py`. To run the tests, use the following command:
+All behaviour is covered by unit tests. They replay a single saved HTML fixture (no live traffic). Run them with:
 
 ```bash
 python -m unittest ChatPeek_test.py
 ```
 
-## Contributing
+## Responsible use
 
-Contributions are welcome! Please submit a pull request or create an issue to discuss any changes you wish to make.
+ChatPeek is designed for personal conversation exports. It makes one GET request per share (matching a real browser) and uses the data already embedded in the page - there is no scraping of private APIs or bulk harvesting. Please keep usage within those boundaries.
 
 ## License
 
 This project is licensed under the MIT License.
-
-## Classes
-
-### ReplyType
-An Enum for specifying the type of reply, either `HUMAN` or `AI`.
-
-### Reply
-Represents a single reply in a conversation, with a author names (if public), a reply type, and the statement content.
-
-### Chat
-Represents a full chat conversation, with a timestamp, user name, AI model, a title and a list of `Reply` objects.
-
-### ChatPeek
-The main class that takes a ChatGPT shared conversation link and parses it into a `Chat` object. 
