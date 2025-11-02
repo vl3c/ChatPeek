@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict, List, cast
 from unittest import mock
 
 import requests
@@ -9,6 +10,8 @@ import requests
 from ChatPeek import (
     Chat,
     ChatPeek,
+    JsonValue,
+    ShareAccessError,
     decode_loader,
     extract_loader_payload,
     fetch_share_page,
@@ -16,38 +19,42 @@ from ChatPeek import (
     parse_modern_share,
     parse_share_html,
     slugify_title,
-    ShareAccessError,
 )
 
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
-SHARE_FIXTURE = FIXTURES / "690781ed-75f0-8006-9d6e-d9229bd932f2.html"
+FIXTURES: Path = Path(__file__).resolve().parent / "fixtures"
+SHARE_FIXTURE: Path = FIXTURES / "690781ed-75f0-8006-9d6e-d9229bd932f2.html"
 
 
 class ChatPeekModuleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.html = SHARE_FIXTURE.read_text(encoding="utf-8")
+        self.html: str = SHARE_FIXTURE.read_text(encoding="utf-8")
 
-    def test_extract_loader_payload(self):
+    def test_extract_loader_payload(self) -> None:
         payload = extract_loader_payload(self.html)
+        self.assertIsNotNone(payload)
+        assert payload is not None
         self.assertIsInstance(payload, list)
         self.assertGreater(len(payload), 1000)
 
-    def test_decode_loader_contains_share_id(self):
+    def test_decode_loader_contains_share_id(self) -> None:
         loader = extract_loader_payload(self.html)
+        self.assertIsNotNone(loader)
+        assert loader is not None
         decoded = decode_loader(loader)
-        route = decoded["loaderData"]["routes/share.$shareId.($action)"]
+        loader_data = cast(Dict[str, Any], decoded["loaderData"])
+        route = cast(Dict[str, Any], loader_data["routes/share.$shareId.($action)"])
         self.assertEqual(route["sharedConversationId"], "690781ed-75f0-8006-9d6e-d9229bd932f2")
 
-    def test_parse_modern_share_returns_chat(self):
+    def test_parse_modern_share_returns_chat(self) -> None:
         chat = parse_modern_share(self.html)
         self.assertIsInstance(chat, Chat)
         self.assertEqual(chat.share_id, "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertIn("Gigawatt", chat.title)
         self.assertGreater(len(chat.replies), 10)
 
-    def test_flatten_message_content_formats_text(self):
-        message = {
+    def test_flatten_message_content_formats_text(self) -> None:
+        message: Dict[str, Any] = {
             "id": "abc",
             "content": {"content_type": "text", "parts": ["Hello", "World"]},
             "metadata": {},
@@ -56,8 +63,8 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(text, "Hello\n\nWorld")
         self.assertEqual(assets, [])
 
-    def test_flatten_message_content_with_code(self):
-        message = {
+    def test_flatten_message_content_with_code(self) -> None:
+        message: Dict[str, Any] = {
             "id": "code",
             "content": {"content_type": "code", "language": "python", "text": "print('hi')\n"},
             "metadata": {},
@@ -66,8 +73,8 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertIn("```python", text)
         self.assertIn("print('hi')", text)
 
-    def test_flatten_message_content_adds_attachments(self):
-        message = {
+    def test_flatten_message_content_adds_attachments(self) -> None:
+        message: Dict[str, Any] = {
             "id": "att",
             "content": {"content_type": "text", "parts": ["See file"]},
             "metadata": {
@@ -85,8 +92,8 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].filename, "file.txt")
 
-    def test_flatten_message_content_parses_structured_json(self):
-        message = {
+    def test_flatten_message_content_parses_structured_json(self) -> None:
+        message: Dict[str, Any] = {
             "id": "json",
             "content": {
                 "content_type": "text",
@@ -100,8 +107,8 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(text, "Only include this text")
         self.assertEqual(assets, [])
 
-    def test_flatten_message_content_multimodal_file_pointer(self):
-        message = {
+    def test_flatten_message_content_multimodal_file_pointer(self) -> None:
+        message: Dict[str, Any] = {
             "id": "msg-1234",
             "content": {
                 "content_type": "multimodal_text",
@@ -120,8 +127,8 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].asset_type, "file")
 
-    def test_flatten_message_content_non_downloadable_pointer_adds_note(self):
-        message = {
+    def test_flatten_message_content_non_downloadable_pointer_adds_note(self) -> None:
+        message: Dict[str, Any] = {
             "id": "msg-asset",
             "content": {
                 "content_type": "multimodal_text",
@@ -139,13 +146,13 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertFalse(assets[0].downloadable)
 
-    def test_slugify_title_includes_share_suffix(self):
+    def test_slugify_title_includes_share_suffix(self) -> None:
         slug = slugify_title("Gigawatt Data Centers", "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertTrue(slug.startswith("gigawatt-data-centers"))
         self.assertTrue(slug.endswith("690781ed"))
 
-    def test_parse_share_html_falls_back_to_legacy(self):
-        legacy_data = {
+    def test_parse_share_html_falls_back_to_legacy(self) -> None:
+        legacy_data: Dict[str, Any] = {
             "props": {
                 "pageProps": {
                     "serverResponse": {
@@ -182,7 +189,7 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(chat.replies), 2)
 
     @mock.patch("requests.get")
-    def test_fetch_share_page_sets_headers(self, mock_get):
+    def test_fetch_share_page_sets_headers(self, mock_get: mock.Mock) -> None:
         mock_response = mock.Mock(spec=requests.Response)
         mock_response.raise_for_status.return_value = None
         mock_response.text = "<html></html>"
@@ -193,7 +200,7 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertTrue(kwargs["headers"]["User-Agent"].startswith("Mozilla"))
 
     @mock.patch("requests.get")
-    def test_fetch_share_page_private_chat_raises_share_access_error(self, mock_get):
+    def test_fetch_share_page_private_chat_raises_share_access_error(self, mock_get: mock.Mock) -> None:
         mock_response = mock.Mock(spec=requests.Response)
         mock_response.status_code = 403
         mock_response.text = ""
@@ -205,12 +212,12 @@ class ChatPeekModuleTests(unittest.TestCase):
 
         self.assertIn("private conversation", str(ctx.exception))
 
-    def test_chat_to_markdown_includes_table(self):
+    def test_chat_to_markdown_includes_table(self) -> None:
         chat = parse_modern_share(self.html)
         markdown = chat.to_markdown()
         self.assertIn("| Project | Location", markdown)
 
-    def test_chat_save_markdown_creates_file(self):
+    def test_chat_save_markdown_creates_file(self) -> None:
         chat = parse_modern_share(self.html)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
@@ -219,7 +226,7 @@ class ChatPeekModuleTests(unittest.TestCase):
             self.assertTrue(md_path.read_text(encoding="utf-8"))
 
     @mock.patch("ChatPeek.fetch_share_page")
-    def test_chatpeek_constructs_chat_once(self, mock_fetch):
+    def test_chatpeek_constructs_chat_once(self, mock_fetch: mock.Mock) -> None:
         mock_fetch.return_value = self.html
         instance = ChatPeek("https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertIsInstance(instance.chat, Chat)

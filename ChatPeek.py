@@ -11,13 +11,16 @@ from datetime import datetime
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
 from urllib.parse import urlparse
 
-import requests  # type: ignore[import]
+import requests
+
+JsonScalar = Union[str, int, float, bool, None]
+JsonValue = Union[JsonScalar, Dict[str, "JsonValue"], List["JsonValue"]]
 
 
-DEFAULT_HEADERS = {
+DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
@@ -33,7 +36,7 @@ DEFAULT_HEADERS = {
 }
 
 
-EXPORT_ROOT = Path("Exports")
+EXPORT_ROOT: Path = Path("Exports")
 
 
 class _ScriptCollector(HTMLParser):
@@ -44,13 +47,13 @@ class _ScriptCollector(HTMLParser):
         self._current_data: List[str] = []
         self.scripts: List[Tuple[Dict[str, str], str]] = []
 
-    def handle_starttag(self, tag: str, attrs):
+    def handle_starttag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
         if tag.lower() == "script":
             self._in_script = True
             self._current_attrs = {name: (value or "") for name, value in attrs}
             self._current_data = []
 
-    def handle_endtag(self, tag: str):
+    def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "script" and self._in_script:
             content = "".join(self._current_data)
             self.scripts.append((self._current_attrs, content))
@@ -58,7 +61,7 @@ class _ScriptCollector(HTMLParser):
             self._current_attrs = {}
             self._current_data = []
 
-    def handle_data(self, data: str):
+    def handle_data(self, data: str) -> None:
         if self._in_script:
             self._current_data.append(data)
 
@@ -209,7 +212,7 @@ def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout
     return response.text
 
 
-def extract_loader_payload(html: str) -> Optional[List]:
+def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
     """Extract the React Flight loader payload if present."""
 
     for _attrs, text in _extract_scripts(html):
@@ -235,41 +238,49 @@ def extract_loader_payload(html: str) -> Optional[List]:
             chunk = chunk.strip()
             if chunk.startswith("["):
                 try:
-                    return json.loads(chunk)
+                    parsed_chunk = json.loads(chunk)
                 except json.JSONDecodeError:
-                    pass
+                    parsed_chunk = None
+                if isinstance(parsed_chunk, list):
+                    return cast(List[JsonValue], parsed_chunk)
             start = end + 2
     return None
 
 
-def decode_loader(loader: List) -> Dict:
+def decode_loader(loader: List[JsonValue]) -> Dict[str, JsonValue]:
     """Decode the flattened loader list into dictionaries and lists."""
 
-    cache: Dict[int, object] = {}
+    cache: Dict[int, JsonValue] = {}
 
-    def decode_key(raw_key: str) -> str:
+    def decode_key(raw_key: JsonValue) -> str:
         if isinstance(raw_key, str) and raw_key.startswith("_") and raw_key[1:].isdigit():
             idx = int(raw_key[1:])
-            if 0 <= idx < len(loader) and isinstance(loader[idx], str):
-                return loader[idx]
-        return raw_key
+            if 0 <= idx < len(loader):
+                candidate = loader[idx]
+                if isinstance(candidate, str):
+                    return candidate
+        return str(raw_key)
 
-    def resolve(value):
+    def resolve(value: JsonValue) -> JsonValue:
         if type(value) is int:
             if value in cache:
                 return cache[value]
             if not (0 <= value < len(loader)):
-                return value
-            cache[value] = None
-            cache[value] = resolve(loader[value])
-            return cache[value]
+                return cast(JsonValue, value)
+            cache[value] = cast(JsonValue, None)
+            resolved_value = resolve(loader[value])
+            cache[value] = resolved_value
+            return resolved_value
         if isinstance(value, list):
-            return [resolve(item) for item in value]
+            return cast(JsonValue, [resolve(item) for item in value])
         if isinstance(value, dict):
-            return {decode_key(k): resolve(v) for k, v in value.items()}
+            return cast(
+                JsonValue,
+                {decode_key(k): resolve(v) for k, v in value.items()},
+            )
         return value
 
-    resolved: Dict[str, object] = {}
+    resolved: Dict[str, JsonValue] = {}
     iterator = iter(loader[1:])
     for key in iterator:
         try:
@@ -283,42 +294,70 @@ def decode_loader(loader: List) -> Dict:
 
 def parse_modern_share(html: str) -> Chat:
     loader = extract_loader_payload(html)
-    if not loader:
+    if loader is None:
         raise ValueError("Modern share payload not found")
 
     decoded = decode_loader(loader)
-    route = decoded["loaderData"]["routes/share.$shareId.($action)"]
-    data = route["serverResponse"]["data"]
-    share_id = route["sharedConversationId"]
-    model_slug = data.get("model", {}).get("slug", "")
-    title = data.get("title", "")
-    updated_at = data.get("update_time")
-    mapping = data.get("mapping", {})
-    sequence = data.get("linear_conversation", [])
+    loader_data = cast(Mapping[str, Any], decoded.get("loaderData", {}))
+    route = cast(Mapping[str, Any], loader_data.get("routes/share.$shareId.($action)", {}))
+    server_response = cast(Mapping[str, Any], route.get("serverResponse", {}))
+    data = cast(Mapping[str, Any], server_response.get("data", {}))
+    share_id_value = route.get("sharedConversationId")
+    share_id = share_id_value if isinstance(share_id_value, str) else "shared"
+    model = cast(Mapping[str, Any], data.get("model", {}))
+    model_slug_value = model.get("slug")
+    model_slug = model_slug_value if isinstance(model_slug_value, str) else ""
+    title_value = data.get("title")
+    title = title_value if isinstance(title_value, str) else ""
+    updated_raw = data.get("update_time")
+    if isinstance(updated_raw, (int, float)):
+        updated_at: Optional[float] = float(updated_raw)
+    else:
+        updated_at = None
+    mapping = cast(Mapping[str, Any], data.get("mapping", {}))
+    sequence_field = data.get("linear_conversation", [])
+    sequence: List[Mapping[str, Any]] = (
+        [entry for entry in sequence_field if isinstance(entry, Mapping)]
+        if isinstance(sequence_field, list)
+        else []
+    )
 
     replies: List[Reply] = []
     for entry in sequence:
-        node = mapping.get(entry.get("id"))
+        node_id_raw = entry.get("id") if isinstance(entry, Mapping) else None
+        if not isinstance(node_id_raw, str):
+            continue
+        node = mapping.get(node_id_raw)
         if not node:
+            continue
+        if not isinstance(node, Mapping):
             continue
         message = node.get("message")
         if not message:
             continue
-        role = message.get("author", {}).get("role")
+        if not isinstance(message, Mapping):
+            continue
+        author_info = message.get("author") or {}
+        role = author_info.get("role") if isinstance(author_info, Mapping) else None
         if role == "system":
             continue
         content = message.get("content") or {}
-        statement, assets = flatten_message_content(message.get("id"), content, message)
+        if not isinstance(content, Mapping):
+            continue
+        message_id = cast(Optional[str], message.get("id"))
+        statement, assets = flatten_message_content(message_id, content, message)
         if not statement and not assets:
             continue
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
         author = author_name_for_role(role)
+        created_raw = message.get("create_time")
+        created_at = float(created_raw) if isinstance(created_raw, (int, float)) else None
         replies.append(
             Reply(
                 author_name=author,
                 type=reply_type,
                 statement=statement,
-                created_at=message.get("create_time"),
+                created_at=created_at,
                 assets=assets,
             )
         )
@@ -335,33 +374,54 @@ def parse_legacy_share(html: str) -> Chat:
 
     if not script_content:
         raise ValueError("Legacy share payload not found")
-    payload = json.loads(script_content)
-    data = payload["props"]["pageProps"]["serverResponse"]["data"]
-    share_id = data.get("conversation_id", "shared")
-    model_slug = data.get("model", {}).get("slug", "")
-    title = data.get("title", "")
-    updated_at = data.get("update_time")
-    author_name = data.get("author_name", "User")
+    payload = cast(Dict[str, Any], json.loads(script_content))
+    props = cast(Mapping[str, Any], payload.get("props", {}))
+    page_props = cast(Mapping[str, Any], props.get("pageProps", {}))
+    server_response = cast(Mapping[str, Any], page_props.get("serverResponse", {}))
+    data = cast(Mapping[str, Any], server_response.get("data", {}))
+    share_id = cast(str, data.get("conversation_id", "shared"))
+    model = cast(Mapping[str, Any], data.get("model", {}))
+    model_slug_value = model.get("slug")
+    model_slug = model_slug_value if isinstance(model_slug_value, str) else ""
+    title_value = data.get("title")
+    title = title_value if isinstance(title_value, str) else ""
+    updated_raw = data.get("update_time")
+    if isinstance(updated_raw, (int, float)):
+        updated_at: Optional[float] = float(updated_raw)
+    else:
+        updated_at = None
+    author_name_raw = data.get("author_name", "User")
+    author_name = author_name_raw if isinstance(author_name_raw, str) else "User"
+    sequence = cast(List[Mapping[str, Any]], data.get("linear_conversation", []))
+
     replies: List[Reply] = []
-    for node in data.get("linear_conversation", []):
-        message = node.get("message")
-        if not message:
+    for node in sequence:
+        if not isinstance(node, Mapping):
             continue
-        role = message.get("author", {}).get("role")
+        message = node.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        author_info = message.get("author") or {}
+        role = author_info.get("role") if isinstance(author_info, Mapping) else None
         if role == "system":
             continue
         content = message.get("content") or {}
-        statement, assets = flatten_message_content(message.get("id"), content, message)
+        if not isinstance(content, Mapping):
+            continue
+        message_id = cast(Optional[str], message.get("id"))
+        statement, assets = flatten_message_content(message_id, content, message)
         if not statement and not assets:
             continue
         author = author_name if role == "user" else author_name_for_role(role)
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
+        created_raw = message.get("create_time")
+        created_at = float(created_raw) if isinstance(created_raw, (int, float)) else None
         replies.append(
             Reply(
                 author_name=author,
                 type=reply_type,
                 statement=statement,
-                created_at=message.get("create_time"),
+                created_at=created_at,
                 assets=assets,
             )
         )
@@ -393,8 +453,8 @@ def strip_private_use(text: str) -> str:
 
 def flatten_message_content(
     message_id: Optional[str],
-    content: Dict,
-    message: Dict,
+    content: Mapping[str, Any],
+    message: Mapping[str, Any],
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
     assets: List[ConversationAsset] = []
@@ -412,27 +472,43 @@ def flatten_message_content(
         return f"*{kind} '{label}' not included in export (source: {source}).*"
 
     def finalize(text: str) -> Tuple[str, List[ConversationAsset]]:
-        metadata = message.get("metadata") or {}
+        metadata_raw = message.get("metadata") or {}
+        metadata = metadata_raw if isinstance(metadata_raw, Mapping) else {}
         attachment_lines: List[str] = []
 
-        for attachment in metadata.get("attachments", []):
-            url = attachment.get("download_url") or attachment.get("file_url")
-            if not url:
-                continue
-            mime = attachment.get("mime_type")
-            filename = attachment.get("name") or build_asset_filename(message_id, len(assets), mime)
-            asset_type = attachment.get("file_type") or attachment.get("type") or "file"
-            downloadable = bool(url and url.lower().startswith("http"))
-            assets.append(
-                ConversationAsset(
-                    asset_type="image" if "image" in (asset_type or "").lower() else "file",
-                    url=url,
-                    filename=filename,
-                    description=attachment.get("title") or attachment.get("name"),
-                    downloadable=downloadable,
+        attachments_field = metadata.get("attachments", [])
+        if isinstance(attachments_field, list):
+            for attachment_raw in attachments_field:
+                if not isinstance(attachment_raw, Mapping):
+                    continue
+                url_raw = attachment_raw.get("download_url") or attachment_raw.get("file_url")
+                url = url_raw if isinstance(url_raw, str) else None
+                if not url:
+                    continue
+                mime = attachment_raw.get("mime_type")
+                mime_str = mime if isinstance(mime, str) else None
+                name_value = attachment_raw.get("name")
+                name = name_value if isinstance(name_value, str) else None
+                filename = name or build_asset_filename(message_id, len(assets), mime_str)
+                asset_type_raw = (
+                    attachment_raw.get("file_type")
+                    or attachment_raw.get("type")
+                    or "file"
                 )
-            )
-            attachment_lines.append(render_asset_reference(assets[-1]))
+                asset_type = asset_type_raw if isinstance(asset_type_raw, str) else "file"
+                downloadable = url.lower().startswith("http")
+                description_raw = attachment_raw.get("title") or attachment_raw.get("name")
+                description = description_raw if isinstance(description_raw, str) else None
+                assets.append(
+                    ConversationAsset(
+                        asset_type="image" if "image" in asset_type.lower() else "file",
+                        url=url,
+                        filename=filename,
+                        description=description,
+                        downloadable=downloadable,
+                    )
+                )
+                attachment_lines.append(render_asset_reference(assets[-1]))
         combined = text.strip()
         if attachment_lines:
             combined = (combined + "\n\n" if combined else "") + "\n".join(attachment_lines)
@@ -440,10 +516,12 @@ def flatten_message_content(
 
     if content_type == "text":
         parsed_parts: List[str] = []
-        for part in content.get("parts", []):
-            if not part:
-                continue
-            cleaned = strip_private_use(part).strip("\n")
+        parts_field = content.get("parts", [])
+        if isinstance(parts_field, list):
+            for part in parts_field:
+                if not isinstance(part, str):
+                    continue
+                cleaned = strip_private_use(part).strip("\n")
             parsed = cleaned
             if cleaned.startswith("{") and cleaned.endswith("}"):
                 try:
@@ -456,59 +534,78 @@ def flatten_message_content(
                         parsed = response
                     else:
                         parsed = maybe_json.get("content") or cleaned
-            parsed_parts.append(parsed)
+                parsed_parts.append(parsed)
         parts = parsed_parts
         return finalize("\n\n".join(part for part in parts if part))
 
     if content_type == "code":
         language = content.get("language")
         code_text = content.get("text", "")
-        lang = language if language and language != "unknown" else ""
-        body = code_text.rstrip("\n")
+        lang = language if isinstance(language, str) and language != "unknown" else ""
+        text_body = code_text if isinstance(code_text, str) else ""
+        body = text_body.rstrip("\n")
         return finalize(f"```{lang}\n{body}\n```")
 
     if content_type == "thoughts":
-        thoughts = []
-        for thought in content.get("thoughts", []):
-            summary = thought.get("summary")
-            detail = thought.get("content")
-            combined = ": ".join(filter(None, [summary, detail]))
-            if combined:
-                thoughts.append(f"_{combined}_")
+        thoughts: List[str] = []
+        thoughts_field = content.get("thoughts", [])
+        if isinstance(thoughts_field, list):
+            for thought in thoughts_field:
+                if not isinstance(thought, Mapping):
+                    continue
+                summary_raw = thought.get("summary")
+                detail_raw = thought.get("content")
+                summary = summary_raw if isinstance(summary_raw, str) else None
+                detail = detail_raw if isinstance(detail_raw, str) else None
+                combined = ": ".join(filter(None, [summary, detail]))
+                if combined:
+                    thoughts.append(f"_{combined}_")
         return finalize("\n\n".join(thoughts))
 
     if content_type == "reasoning_recap":
-        recap = content.get("content", "")
+        recap_raw = content.get("content", "")
+        recap = recap_raw if isinstance(recap_raw, str) else ""
         return finalize(f"_{recap.strip()}_" if recap else "")
 
     if content_type == "model_editable_context":
-        return finalize((content.get("model_set_context", "") or "").strip())
+        model_context = content.get("model_set_context", "")
+        if isinstance(model_context, str):
+            return finalize(model_context.strip())
+        return finalize("")
 
     if content_type == "multimodal_text":
         segments: List[str] = []
-        for part in content.get("parts", []):
-            if isinstance(part, str):
-                segments.append(strip_private_use(part))
-            elif isinstance(part, dict):
-                p_type = part.get("content_type") or part.get("type")
+        parts_field = content.get("parts", [])
+        if isinstance(parts_field, list):
+            for part in parts_field:
+                if isinstance(part, str):
+                    segments.append(strip_private_use(part))
+                    continue
+                if not isinstance(part, Mapping):
+                    continue
+                p_type_raw = part.get("content_type") or part.get("type")
+                p_type = p_type_raw if isinstance(p_type_raw, str) else None
                 if p_type == "text":
                     texts = part.get("text")
                     if isinstance(texts, list):
-                        segments.extend(strip_private_use(t) for t in texts)
+                        segments.extend(
+                            strip_private_use(t) for t in texts if isinstance(t, str)
+                        )
                     elif isinstance(texts, str):
                         segments.append(strip_private_use(texts))
                 elif p_type in {"image_asset_pointer", "file"}:
                     pointer_raw = part.get("asset_pointer")
                     if not isinstance(pointer_raw, str) or not pointer_raw:
                         continue
-                    filename = build_asset_filename(message_id, len(assets), part.get("mime_type"))
+                    mime_value = part.get("mime_type")
+                    mime = mime_value if isinstance(mime_value, str) else None
+                    filename = build_asset_filename(message_id, len(assets), mime)
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
-                    pointer = pointer_raw
-                    downloadable = pointer.lower().startswith("http")
+                    downloadable = pointer_raw.lower().startswith("http")
                     assets.append(
                         ConversationAsset(
                             asset_type=asset_type,
-                            url=pointer,
+                            url=pointer_raw,
                             filename=filename,
                             downloadable=downloadable,
                         )
@@ -517,13 +614,16 @@ def flatten_message_content(
         return finalize("\n\n".join(segment.strip() for segment in segments if segment.strip()))
 
     if content_type == "tool_response":
-        output = content.get("output", "")
+        output_raw = content.get("output", "")
+        output = output_raw if isinstance(output_raw, str) else ""
         return finalize(strip_private_use(output))
 
     # Attempt a generic text conversion as last resort
     if "parts" in content:
-        parts = [strip_private_use(str(part)) for part in content.get("parts", []) if part]
-        return finalize("\n\n".join(parts).strip())
+        parts_field = content.get("parts", [])
+        if isinstance(parts_field, list):
+            parts = [strip_private_use(str(part)) for part in parts_field if part]
+            return finalize("\n\n".join(parts).strip())
 
     return finalize("")
 
@@ -546,8 +646,8 @@ def slugify_title(title: str, share_id: str) -> str:
 class ChatPeek:
     """High-level facade for downloading and exporting shared conversations."""
 
-    def __init__(self, link: str):
-        self._link = link
+    def __init__(self, link: str) -> None:
+        self._link: str = link
         html = fetch_share_page(link)
         self._chat = parse_share_html(html)
 
