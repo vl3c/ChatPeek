@@ -149,6 +149,19 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertFalse(assets[0].downloadable)
 
+    def test_extract_loader_payload_with_semicolons_in_content(self) -> None:
+        inner = json.dumps(json.dumps(["data with ); inside", 1, {"key": "val ; ) more"}]))
+        html = (
+            "<html><script>"
+            f'streamController.enqueue({inner});'
+            "</script></html>"
+        )
+        payload = extract_loader_payload(html)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIsInstance(payload, list)
+        self.assertEqual(payload[0], "data with ); inside")
+
     def test_slugify_title_includes_share_suffix(self) -> None:
         slug = slugify_title("Gigawatt Data Centers", "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertTrue(slug.startswith("gigawatt-data-centers"))

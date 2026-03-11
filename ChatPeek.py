@@ -218,32 +218,39 @@ def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
     for _attrs, text in _extract_scripts(html):
         if not text or "streamController.enqueue" not in text:
             continue
+        decoder = json.JSONDecoder()
         start = 0
         while True:
             anchor = text.find("streamController.enqueue(", start)
             if anchor == -1:
                 break
             anchor += len("streamController.enqueue(")
-            end = text.find(");", anchor)
-            if end == -1:
-                break
-            chunk = text[anchor:end].strip()
-            if chunk.startswith("(") and chunk.endswith(")"):
-                chunk = chunk[1:-1].strip()
-            if chunk.startswith("\"") and chunk.endswith("\""):
+            quote_pos = text.find("\"", anchor)
+            next_close = text.find(");", anchor)
+            if quote_pos != -1 and (next_close == -1 or quote_pos < next_close):
                 try:
-                    chunk = json.loads(chunk)
+                    chunk, end_offset = decoder.raw_decode(text, quote_pos)
                 except json.JSONDecodeError:
-                    pass
-            chunk = chunk.strip()
-            if chunk.startswith("["):
+                    start = anchor + 1
+                    continue
+                start = end_offset
+            else:
+                end = text.find(");", anchor)
+                if end == -1:
+                    break
+                chunk = text[anchor:end].strip()
+                if chunk.startswith("(") and chunk.endswith(")"):
+                    chunk = chunk[1:-1].strip()
+                start = end + 2
+            if isinstance(chunk, str):
+                chunk = chunk.strip()
+            if isinstance(chunk, str) and chunk.startswith("["):
                 try:
                     parsed_chunk = json.loads(chunk)
                 except json.JSONDecodeError:
                     parsed_chunk = None
                 if isinstance(parsed_chunk, list):
                     return cast(List[JsonValue], parsed_chunk)
-            start = end + 2
     return None
 
 
