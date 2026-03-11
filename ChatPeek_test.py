@@ -158,6 +158,19 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertFalse(assets[0].downloadable)
 
+    def test_extract_loader_payload_with_semicolons_in_content(self) -> None:
+        inner = json.dumps(json.dumps(["data with ); inside", 1, {"key": "val ; ) more"}]))
+        html = (
+            "<html><script>"
+            f'streamController.enqueue({inner});'
+            "</script></html>"
+        )
+        payload = extract_loader_payload(html)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIsInstance(payload, list)
+        self.assertEqual(payload[0], "data with ); inside")
+
     @mock.patch("requests.get")
     def test_fetch_share_page_sets_headers(self, mock_get: mock.Mock) -> None:
         mock_response = mock.Mock(spec=requests.Response)
