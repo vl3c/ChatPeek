@@ -225,12 +225,11 @@ def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
             if anchor == -1:
                 break
             anchor += len("streamController.enqueue(")
-            content_start = anchor
-            while content_start < len(text) and text[content_start] in " \t\n\r":
-                content_start += 1
-            if content_start < len(text) and text[content_start] == "\"":
+            quote_pos = text.find("\"", anchor)
+            next_close = text.find(");", anchor)
+            if quote_pos != -1 and (next_close == -1 or quote_pos < next_close):
                 try:
-                    chunk, end_offset = decoder.raw_decode(text, content_start)
+                    chunk, end_offset = decoder.raw_decode(text, quote_pos)
                 except json.JSONDecodeError:
                     start = anchor + 1
                     continue
