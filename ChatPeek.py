@@ -79,6 +79,15 @@ class ReplyType(Enum):
     TOOL = "tool"
 
 
+@dataclass(frozen=True)
+class ExportOptions:
+    """Controls which internal conversation details are included in exports."""
+
+    include_reasoning: bool = False
+    include_tool_output: bool = False
+    include_model_context: bool = False
+
+
 @dataclass
 class ConversationAsset:
     """Represents an external asset referenced by a message."""
@@ -299,7 +308,8 @@ def decode_loader(loader: List[JsonValue]) -> Dict[str, JsonValue]:
     return resolved
 
 
-def parse_modern_share(html: str) -> Chat:
+def parse_modern_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     loader = extract_loader_payload(html)
     if loader is None:
         raise ValueError("Modern share payload not found")
@@ -352,8 +362,10 @@ def parse_modern_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, export_options)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
         author = author_name_for_role(role)
@@ -372,7 +384,8 @@ def parse_modern_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_legacy_share(html: str) -> Chat:
+def parse_legacy_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     script_content: Optional[str] = None
     for attrs, text in _extract_scripts(html):
         if attrs.get("id") == "__NEXT_DATA__":
@@ -416,8 +429,10 @@ def parse_legacy_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, export_options)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         author = author_name if role == "user" else author_name_for_role(role)
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
@@ -436,11 +451,11 @@ def parse_legacy_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_share_html(html: str) -> Chat:
+def parse_share_html(html: str, options: Optional[ExportOptions] = None) -> Chat:
     try:
-        return parse_modern_share(html)
+        return parse_modern_share(html, options)
     except (ValueError, KeyError):
-        return parse_legacy_share(html)
+        return parse_legacy_share(html, options)
 
 
 def author_name_for_role(role: Optional[str]) -> str:
@@ -494,6 +509,42 @@ def summarize_tool_payload(data: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def is_tool_invocation_payload(data: Mapping[str, Any]) -> bool:
+    tool_keys = {
+        "click",
+        "edit",
+        "file",
+        "finance",
+        "image_query",
+        "input",
+        "move",
+        "open",
+        "press_key",
+        "response_length",
+        "search_query",
+        "time",
+        "weather",
+        "sports",
+    }
+    if any(key in data for key in tool_keys):
+        return True
+    return False
+
+
+def should_include_content(content_type: Optional[str], options: ExportOptions) -> bool:
+    if content_type in {"thoughts", "reasoning_recap"}:
+        return options.include_reasoning
+    if content_type == "tool_response":
+        return options.include_tool_output
+    if content_type == "model_editable_context":
+        return options.include_model_context
+    return True
+
+
+def is_redacted_tool_output(text: str) -> bool:
+    return text.strip() == "The output of this plugin was redacted."
+
+
 def strip_private_use(text: str) -> str:
     return PRIVATE_USE_PATTERN.sub("", text)
 
@@ -512,8 +563,10 @@ def flatten_message_content(
     message_id: Optional[str],
     content: Mapping[str, Any],
     message: Mapping[str, Any],
+    options: Optional[ExportOptions] = None,
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
+    export_options = options or ExportOptions()
     assets: List[ConversationAsset] = []
 
     def render_asset_reference(asset: ConversationAsset) -> str:
@@ -609,8 +662,12 @@ def flatten_message_content(
             except json.JSONDecodeError:
                 maybe_json = None
             if isinstance(maybe_json, Mapping):
+                if is_tool_invocation_payload(maybe_json):
+                    return finalize("")
                 summary = summarize_tool_payload(maybe_json)
                 if summary is not None:
+                    if not export_options.include_tool_output:
+                        return finalize("")
                     return finalize(summary)
                 cleaned_dict = {
                     key: value
@@ -623,6 +680,8 @@ def flatten_message_content(
         return finalize(f"```{lang}\n{body}\n```")
 
     if content_type == "thoughts":
+        if not export_options.include_reasoning:
+            return finalize("")
         thoughts: List[str] = []
         thoughts_field = content.get("thoughts", [])
         if isinstance(thoughts_field, list):
@@ -639,11 +698,15 @@ def flatten_message_content(
         return finalize("\n\n".join(thoughts))
 
     if content_type == "reasoning_recap":
+        if not export_options.include_reasoning:
+            return finalize("")
         recap_raw = content.get("content", "")
         recap = recap_raw if isinstance(recap_raw, str) else ""
         return finalize(f"_{recap.strip()}_" if recap else "")
 
     if content_type == "model_editable_context":
+        if not export_options.include_model_context:
+            return finalize("")
         model_context = content.get("model_set_context", "")
         if isinstance(model_context, str):
             return finalize(model_context.strip())
@@ -690,6 +753,8 @@ def flatten_message_content(
         return finalize("\n\n".join(segment.strip() for segment in segments if segment.strip()))
 
     if content_type == "tool_response":
+        if not export_options.include_tool_output:
+            return finalize("")
         output_raw = content.get("output", "")
         output = output_raw if isinstance(output_raw, str) else ""
         return finalize(strip_private_use(output))
@@ -722,10 +787,11 @@ def slugify_title(title: str, share_id: str) -> str:
 class ChatPeek:
     """High-level facade for downloading and exporting shared conversations."""
 
-    def __init__(self, link: str) -> None:
+    def __init__(self, link: str, options: Optional[ExportOptions] = None) -> None:
         self._link: str = link
+        self._options = options or ExportOptions()
         html = fetch_share_page(link)
-        self._chat = parse_share_html(html)
+        self._chat = parse_share_html(html, self._options)
 
     @property
     def chat(self) -> Chat:
@@ -746,6 +812,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         action="store_true",
         help="Do not download linked assets (images, attachments)",
     )
+    parser.add_argument(
+        "--include-reasoning",
+        action="store_true",
+        help="Include reasoning traces such as thoughts and reasoning recaps",
+    )
+    parser.add_argument(
+        "--include-tool-output",
+        action="store_true",
+        help="Include tool outputs and tool payload summaries",
+    )
+    parser.add_argument(
+        "--include-model-context",
+        action="store_true",
+        help="Include model editable context blocks",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
@@ -753,7 +834,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    chat = parse_share_html(html)
+    export_options = ExportOptions(
+        include_reasoning=args.include_reasoning,
+        include_tool_output=args.include_tool_output,
+        include_model_context=args.include_model_context,
+    )
+    chat = parse_share_html(html, export_options)
     markdown_path = chat.save_markdown(args.output, download_assets=not args.skip_assets)
     print(markdown_path)
 

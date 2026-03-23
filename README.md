@@ -18,6 +18,15 @@ python ChatPeek.py https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f
 # -> ./gigawatt-data-centers-690781ed.md
 ```
 
+By default, ChatPeek now omits internal reasoning traces, tool outputs, and model editable context from the export. If you want to include them, use:
+
+```bash
+python ChatPeek.py https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2 \
+  --include-reasoning \
+  --include-tool-output \
+  --include-model-context
+```
+
 From Python you can orchestrate the export yourself:
 
 ```python

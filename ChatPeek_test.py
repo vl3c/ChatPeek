@@ -11,6 +11,7 @@ import requests
 from ChatPeek import (
     Chat,
     ChatPeek,
+    ExportOptions,
     ConversationAsset,
     JsonValue,
     Reply,
@@ -28,6 +29,7 @@ from ChatPeek import (
     parse_modern_share,
     parse_share_html,
     slugify_title,
+    is_tool_invocation_payload,
     strip_private_use,
     strip_citation_tokens,
     summarize_tool_payload,
@@ -210,10 +212,28 @@ class ChatPeekModuleTests(unittest.TestCase):
         markdown = chat.to_markdown()
         self.assertNotIn("response_length", markdown)
 
-    def test_chat_markdown_summarizes_tool_queries(self) -> None:
+    def test_chat_markdown_omits_internal_reasoning_by_default(self) -> None:
         chat = parse_modern_share(self.html)
         markdown = chat.to_markdown()
-        self.assertIn("Search tool invoked with queries:", markdown)
+        self.assertNotIn("Thought for a couple of seconds", markdown)
+        self.assertNotIn("Search tool invoked with queries:", markdown)
+        self.assertNotIn("The output of this plugin was redacted.", markdown)
+
+    def test_parse_share_html_can_include_internal_content(self) -> None:
+        chat = parse_share_html(
+            self.html,
+            ExportOptions(
+                include_reasoning=True,
+                include_tool_output=True,
+                include_model_context=True,
+            ),
+        )
+        markdown = chat.to_markdown()
+        self.assertIn("Thinking longer for a better answer", markdown)
+        self.assertIn("Original custom instructions no longer available", markdown)
+        self.assertNotIn("Search tool invoked with queries:", markdown)
+        self.assertNotIn("The output of this plugin was redacted.", markdown)
+        self.assertIn("Thought for 40s", markdown)
 
     def test_markdown_preserves_useful_content(self) -> None:
         chat = parse_modern_share(self.html)
@@ -265,7 +285,11 @@ class ChatPeekModuleTests(unittest.TestCase):
             content = message.get("content")
             if not isinstance(content, Mapping):
                 continue
+            author_info = message.get("author") or {}
+            role = author_info.get("role") if isinstance(author_info, Mapping) else None
             ctype = content.get("content_type")
+            if role == "tool":
+                continue
             if ctype == "text":
                 parts = content.get("parts", [])
                 if isinstance(parts, list):
@@ -283,20 +307,8 @@ class ChatPeekModuleTests(unittest.TestCase):
                     except json.JSONDecodeError:
                         maybe_json = None
                     if isinstance(maybe_json, Mapping):
-                        search_queries = maybe_json.get("search_query")
-                        if isinstance(search_queries, list):
-                            for entry in search_queries:
-                                if isinstance(entry, Mapping):
-                                    query = entry.get("q")
-                                    if isinstance(query, str) and query.strip():
-                                        cleaned_query = self._clean_segment(query.strip())
-                                        if cleaned_query:
-                                            segments.append(cleaned_query)
-                                elif isinstance(entry, str) and entry.strip():
-                                    cleaned_entry = self._clean_segment(entry.strip())
-                                    if cleaned_entry:
-                                        segments.append(cleaned_entry)
-                        continue
+                        if is_tool_invocation_payload(maybe_json):
+                            continue
                     if text.strip():
                         cleaned_text = self._clean_segment(text.strip())
                         if cleaned_text:
@@ -607,6 +619,11 @@ class SummarizeToolPayloadTests(unittest.TestCase):
         # Only 1 bullet for the valid query
         self.assertEqual(result.count("- "), 1)
 
+    def test_detects_tool_invocation_payload(self) -> None:
+        self.assertTrue(is_tool_invocation_payload({"open": [{"ref_id": "abc"}]}))
+        self.assertTrue(is_tool_invocation_payload({"search_query": [{"q": "x"}]}))
+        self.assertFalse(is_tool_invocation_payload({"response": "keep this"}))
+
 
 class BuildAssetFilenameTests(unittest.TestCase):
     def test_basic_filename(self) -> None:
@@ -701,6 +718,16 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
         text, _ = flatten_message_content("m1", message["content"], message)
         self.assertEqual(text, "")
 
+    def test_code_with_tool_invocation_json_is_omitted(self) -> None:
+        payload = json.dumps({"open": [{"ref_id": "abc"}], "response_length": 500})
+        message: Dict[str, Any] = {
+            "id": "m1",
+            "content": {"content_type": "code", "language": "json", "text": payload},
+            "metadata": {},
+        }
+        text, _ = flatten_message_content("m1", message["content"], message)
+        self.assertEqual(text, "")
+
     def test_thoughts_content_type(self) -> None:
         message: Dict[str, Any] = {
             "id": "m1",
@@ -714,8 +741,16 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Thinking: about this problem", text)
-        self.assertIn("Considering: alternatives", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Thinking: about this problem", included_text)
+        self.assertIn("Considering: alternatives", included_text)
 
     def test_thoughts_with_only_summary(self) -> None:
         message: Dict[str, Any] = {
@@ -727,7 +762,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Just a summary", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Just a summary", included_text)
 
     def test_reasoning_recap_content_type(self) -> None:
         message: Dict[str, Any] = {
@@ -736,7 +779,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Recap of reasoning", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Recap of reasoning", included_text)
 
     def test_reasoning_recap_empty(self) -> None:
         message: Dict[str, Any] = {
@@ -754,7 +805,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertEqual(text, "Custom instructions here")
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_model_context=True),
+        )
+        self.assertEqual(included_text, "Custom instructions here")
 
     def test_tool_response_strips_private_use(self) -> None:
         message: Dict[str, Any] = {
@@ -763,7 +822,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertEqual(text, "Resulthere")
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_tool_output=True),
+        )
+        self.assertEqual(included_text, "Resulthere")
 
     def test_unknown_content_type_with_parts_fallback(self) -> None:
         message: Dict[str, Any] = {
