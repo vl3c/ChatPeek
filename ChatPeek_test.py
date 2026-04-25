@@ -26,6 +26,7 @@ from ChatPeek import (
     main,
     parse_legacy_share,
     parse_modern_share,
+    parse_post_share,
     parse_share_html,
     slugify_title,
     strip_private_use,
@@ -64,6 +65,103 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(chat.share_id, "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertIn("Gigawatt", chat.title)
         self.assertGreater(len(chat.replies), 10)
+
+    def test_parse_post_share_returns_message_slice_and_widget_report(self) -> None:
+        report_message = {
+            "id": "report",
+            "author": {"role": "assistant", "metadata": {}},
+            "create_time": 1777135581.0,
+            "content": {
+                "content_type": "text",
+                "parts": ["# Deep Research Report\n\nDetailed findings."],
+            },
+            "metadata": {},
+        }
+        html = self._build_loader_html(
+            {
+                "loaderData": {
+                    "routes/s.$postId": {
+                        "postWithProfile": {
+                            "post": {
+                                "id": "t_post123",
+                                "posted_at": 1777152234.0,
+                                "text": "Post Share",
+                                "attachments": [
+                                    {
+                                        "kind": "message_slice",
+                                        "messages": [
+                                            {
+                                                "id": "user-message",
+                                                "author": {"role": "user", "metadata": {}},
+                                                "create_time": 1777134625.0,
+                                                "content": {
+                                                    "content_type": "text",
+                                                    "parts": ["Find the implementation"],
+                                                },
+                                                "metadata": {},
+                                            },
+                                            {
+                                                "id": "tool-message",
+                                                "author": {"role": "tool", "metadata": {}},
+                                                "create_time": 1777134626.0,
+                                                "content": {
+                                                    "content_type": "code",
+                                                    "language": "json",
+                                                    "text": "{\"session_id\":\"abc\"}",
+                                                },
+                                                "metadata": {
+                                                    "chatgpt_sdk": {
+                                                        "widget_state": json.dumps(
+                                                            {"report_message": report_message}
+                                                        )
+                                                    }
+                                                },
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        chat = parse_post_share(html)
+
+        self.assertEqual(chat.share_id, "t_post123")
+        self.assertEqual(chat.title, "Post Share")
+        self.assertEqual(chat.updated_at, 1777152234.0)
+        self.assertEqual([reply.type for reply in chat.replies], [
+            ReplyType.HUMAN,
+            ReplyType.TOOL,
+            ReplyType.AI,
+        ])
+        self.assertIn("Find the implementation", chat.to_markdown())
+        self.assertIn("Deep Research Report", chat.to_markdown())
+
+    def test_parse_share_html_prefers_post_share_route(self) -> None:
+        html = self._build_loader_html(
+            {
+                "loaderData": {
+                    "routes/s.$postId": {
+                        "postWithProfile": {
+                            "post": {
+                                "id": "t_post456",
+                                "posted_at": 1777152234.0,
+                                "text": "Post Route",
+                                "attachments": [],
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        chat = parse_share_html(html)
+
+        self.assertEqual(chat.share_id, "t_post456")
+        self.assertEqual(chat.title, "Post Route")
 
     def test_flatten_message_content_formats_text(self) -> None:
         message: Dict[str, Any] = {
@@ -327,6 +425,13 @@ class ChatPeekModuleTests(unittest.TestCase):
                                     if piece_cleaned:
                                         segments.append(piece_cleaned)
         return segments
+
+    def _build_loader_html(self, decoded_payload: Mapping[str, Any]) -> str:
+        loader: List[JsonValue] = ["root"]
+        for key, value in decoded_payload.items():
+            loader.extend([key, cast(JsonValue, value)])
+        chunk = json.dumps(json.dumps(loader))
+        return f"<html><script>streamController.enqueue({chunk});</script></html>"
 
     @staticmethod
     def _normalize(text: str) -> str:

@@ -209,7 +209,7 @@ def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout
                 "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
             ) from exc
         raise
-    return response.text
+    return cast(str, response.text)
 
 
 def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
@@ -372,6 +372,86 @@ def parse_modern_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
+def parse_post_share(html: str) -> Chat:
+    loader = extract_loader_payload(html)
+    if loader is None:
+        raise ValueError("Post share payload not found")
+
+    decoded = decode_loader(loader)
+    loader_data = cast(Mapping[str, Any], decoded.get("loaderData", {}))
+    route = cast(Mapping[str, Any], loader_data.get("routes/s.$postId", {}))
+    post_with_profile = cast(Mapping[str, Any], route.get("postWithProfile", {}))
+    post = cast(Mapping[str, Any], post_with_profile.get("post", {}))
+    share_id_value = post.get("id")
+    share_id = share_id_value if isinstance(share_id_value, str) else "shared"
+    title_value = post.get("text")
+    title = title_value if isinstance(title_value, str) else ""
+    posted_at = post.get("posted_at")
+    updated_at = float(posted_at) if isinstance(posted_at, (int, float)) else None
+
+    messages: List[Mapping[str, Any]] = []
+    attachments = post.get("attachments", [])
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            if attachment.get("kind") != "message_slice":
+                continue
+            raw_messages = attachment.get("messages", [])
+            if isinstance(raw_messages, list):
+                messages.extend(
+                    message for message in raw_messages if isinstance(message, Mapping)
+                )
+
+    replies: List[Reply] = []
+
+    def append_message(message: Mapping[str, Any]) -> None:
+        author_info = message.get("author") or {}
+        role = author_info.get("role") if isinstance(author_info, Mapping) else None
+        if role == "system":
+            return
+        content = message.get("content") or {}
+        if not isinstance(content, Mapping):
+            return
+        message_id = cast(Optional[str], message.get("id"))
+        statement, assets = flatten_message_content(message_id, content, message)
+        if not statement and not assets:
+            return
+        reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
+        created_raw = message.get("create_time")
+        created_at = float(created_raw) if isinstance(created_raw, (int, float)) else None
+        replies.append(
+            Reply(
+                author_name=author_name_for_role(role),
+                type=reply_type,
+                statement=statement,
+                created_at=created_at,
+                assets=assets,
+            )
+        )
+
+    for message in messages:
+        append_message(message)
+        metadata = message.get("metadata") or {}
+        metadata_map = metadata if isinstance(metadata, Mapping) else {}
+        chatgpt_sdk = metadata_map.get("chatgpt_sdk") or {}
+        chatgpt_sdk_map = chatgpt_sdk if isinstance(chatgpt_sdk, Mapping) else {}
+        widget_state_raw = chatgpt_sdk_map.get("widget_state")
+        if not isinstance(widget_state_raw, str):
+            continue
+        try:
+            widget_state = json.loads(widget_state_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(widget_state, Mapping):
+            continue
+        report_message = widget_state.get("report_message")
+        if isinstance(report_message, Mapping):
+            append_message(report_message)
+
+    return Chat(share_id=share_id, ai_model="", title=title, updated_at=updated_at, replies=replies)
+
+
 def parse_legacy_share(html: str) -> Chat:
     script_content: Optional[str] = None
     for attrs, text in _extract_scripts(html):
@@ -437,10 +517,20 @@ def parse_legacy_share(html: str) -> Chat:
 
 
 def parse_share_html(html: str) -> Chat:
+    loader = extract_loader_payload(html)
+    if loader is not None:
+        decoded = decode_loader(loader)
+        loader_data = cast(Mapping[str, Any], decoded.get("loaderData", {}))
+        if "routes/s.$postId" in loader_data:
+            return parse_post_share(html)
+
     try:
         return parse_modern_share(html)
     except (ValueError, KeyError):
-        return parse_legacy_share(html)
+        try:
+            return parse_post_share(html)
+        except (ValueError, KeyError):
+            return parse_legacy_share(html)
 
 
 def author_name_for_role(role: Optional[str]) -> str:
