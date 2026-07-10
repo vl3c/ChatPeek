@@ -11,8 +11,8 @@ from datetime import datetime
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -50,6 +50,10 @@ ALLOWED_ASSET_HOST_SUFFIXES: Tuple[str, ...] = (
     "chatgpt.com",
     "openai.com",
     # DALL-E images are served from this OpenAI-owned Azure storage account.
+    # Only this exact account is allowed: matching all of *.blob.core.windows.net
+    # would let a share page point downloads at an attacker's own Azure storage.
+    # Assets on other (newer) OpenAI storage accounts degrade to a placeholder
+    # rather than being fetched — a deliberate security-over-recall tradeoff.
     "oaidalleapiprodscus.blob.core.windows.net",
 )
 
@@ -212,21 +216,26 @@ class Chat:
                     is_image = asset.asset_type == "image"
                     target_dir = images_dir if is_image else files_dir
                     target_path = target_dir / asset.filename
-                    # Asset filenames originate from untrusted share-page JSON;
-                    # never write outside the export folder even if a raw
-                    # filename slipped through sanitization.
-                    if target_path.resolve().parent != resolved_parents[is_image]:
+                    try:
+                        # Asset filenames originate from untrusted share-page JSON;
+                        # never write outside the export folder even if a raw
+                        # filename slipped through sanitization.
+                        if target_path.resolve().parent != resolved_parents[is_image]:
+                            continue
+                        target_dir.mkdir(exist_ok=True)
+                        if target_path.exists():
+                            continue
+                        resp = fetch(asset.url)
+                        resp.raise_for_status()
+                        # A non-allowed redirect returns a non-200 status; skip it
+                        # rather than write the redirect body as the asset.
+                        if getattr(resp, "status_code", 200) != 200:
+                            continue
+                        target_path.write_bytes(resp.content)
+                    except (requests.RequestException, OSError):
+                        # One malformed URL or unwritable filename must not abort
+                        # the export of an otherwise-valid conversation.
                         continue
-                    target_dir.mkdir(exist_ok=True)
-                    if target_path.exists():
-                        continue
-                    resp = fetch(asset.url)
-                    resp.raise_for_status()
-                    # A redirect returns a non-2xx status (redirects are disabled);
-                    # skip it rather than write the redirect body as the asset.
-                    if getattr(resp, "status_code", 200) != 200:
-                        continue
-                    target_path.write_bytes(resp.content)
 
         return markdown_path
 
@@ -235,10 +244,34 @@ class ShareAccessError(RuntimeError):
     """Raised when a share URL cannot be fetched due to access restrictions."""
 
 
+_MAX_ASSET_REDIRECTS = 5
+
+
 def default_http_get(url: str) -> requests.Response:
-    # allow_redirects is disabled so an allowed host cannot redirect the fetch to
-    # an internal address; is_allowed_asset_url only validates the initial URL.
-    return requests.get(url, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
+    """Fetch an asset, following redirects only to other allowed asset hosts.
+
+    Redirects are resolved manually (allow_redirects=False) so a hop to an
+    off-allowlist host — e.g. an internal address reached via an open redirect
+    on an allowed host — is refused *before* the request is made. This keeps the
+    SSRF guard intact while still supporting allowed hosts (such as ChatGPT
+    backend file endpoints) that legitimately redirect to a signed blob URL.
+    """
+
+    current = url
+    response = requests.get(current, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
+    for _ in range(_MAX_ASSET_REDIRECTS):
+        if not response.is_redirect:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            return response
+        current = urljoin(current, location)
+        if not is_allowed_asset_url(current):
+            # Refuse to follow a redirect off the allowlist; the caller sees the
+            # non-200 status and skips the asset rather than fetching internally.
+            return response
+        response = requests.get(current, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
+    return response
 
 
 def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> str:
@@ -379,6 +412,7 @@ def parse_modern_share(html: str) -> Chat:
         else []
     )
 
+    namer = _AssetNamer()
     replies: List[Reply] = []
     for entry in sequence:
         node_id_raw = entry.get("id") if isinstance(entry, Mapping) else None
@@ -402,7 +436,7 @@ def parse_modern_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, namer)
         if not statement and not assets:
             continue
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
@@ -451,6 +485,7 @@ def parse_legacy_share(html: str) -> Chat:
     author_name = author_name_raw if isinstance(author_name_raw, str) else "User"
     sequence = cast(List[Mapping[str, Any]], data.get("linear_conversation", []))
 
+    namer = _AssetNamer()
     replies: List[Reply] = []
     for node in sequence:
         if not isinstance(node, Mapping):
@@ -466,7 +501,7 @@ def parse_legacy_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, namer)
         if not statement and not assets:
             continue
         author = author_name if role == "user" else author_name_for_role(role)
@@ -562,6 +597,7 @@ def flatten_message_content(
     message_id: Optional[str],
     content: Mapping[str, Any],
     message: Mapping[str, Any],
+    namer: Optional["_AssetNamer"] = None,
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
     assets: List[ConversationAsset] = []
@@ -597,6 +633,8 @@ def flatten_message_content(
                 name_value = attachment_raw.get("name")
                 name = name_value if isinstance(name_value, str) else None
                 filename = sanitize_asset_filename(name, message_id, len(assets), mime_str)
+                if namer is not None:
+                    filename = namer.assign(url, filename)
                 asset_type_raw = (
                     attachment_raw.get("file_type")
                     or attachment_raw.get("type")
@@ -726,6 +764,8 @@ def flatten_message_content(
                     mime_value = part.get("mime_type")
                     mime = mime_value if isinstance(mime_value, str) else None
                     filename = build_asset_filename(message_id, len(assets), mime)
+                    if namer is not None:
+                        filename = namer.assign(pointer_raw, filename)
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
                     downloadable = is_allowed_asset_url(pointer_raw)
                     assets.append(
@@ -763,6 +803,10 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"LPT{i}" for i in range(1, 10)}
 )
 
+# Cap the on-disk name well under the ~255-byte NAME_MAX / MAX_PATH limits so an
+# over-long attacker-supplied name cannot make write_bytes raise OSError.
+_MAX_FILENAME_LEN = 200
+
 
 def _scrub_filename_component(text: str) -> str:
     """Replace filesystem-unsafe characters and trim trailing dots/spaces.
@@ -773,6 +817,51 @@ def _scrub_filename_component(text: str) -> str:
     """
 
     return _FILENAME_UNSAFE_PATTERN.sub("_", text).strip().rstrip(" .")
+
+
+def _truncate_filename(name: str) -> str:
+    """Bound a filename's length, preserving a short extension when present."""
+
+    if len(name) <= _MAX_FILENAME_LEN:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if dot and 0 < len(ext) <= 16:
+        return stem[: _MAX_FILENAME_LEN - len(ext) - 1] + "." + ext
+    return name[:_MAX_FILENAME_LEN]
+
+
+class _AssetNamer:
+    """Allocates conversation-unique on-disk filenames for assets.
+
+    Assets that share a URL reuse one filename, so the download dedupe writes the
+    file once and every Markdown link resolves to it. Assets with distinct URLs
+    that would otherwise collide on the same basename (e.g. two attachments both
+    named "report.csv", or names differing only by a stripped directory prefix)
+    get a numeric suffix, so no link ever silently resolves to another asset's
+    bytes.
+    """
+
+    def __init__(self) -> None:
+        self._by_url: Dict[str, str] = {}
+        self._used: Set[str] = set()
+
+    def assign(self, url: str, desired: str) -> str:
+        existing = self._by_url.get(url)
+        if existing is not None:
+            return existing
+        name = desired
+        if name in self._used:
+            stem, dot, ext = desired.rpartition(".")
+            base = stem if dot else desired
+            suffix = dot + ext if dot else ""
+            counter = 1
+            name = f"{base}-{counter}{suffix}"
+            while name in self._used:
+                counter += 1
+                name = f"{base}-{counter}{suffix}"
+        self._used.add(name)
+        self._by_url[url] = name
+        return name
 
 
 def build_asset_filename(message_id: Optional[str], index: int, mime_type: Optional[str]) -> str:
@@ -794,16 +883,20 @@ def sanitize_asset_filename(
     """Reduce an attachment name from the share page to a safe basename.
 
     Names come from untrusted JSON, so path separators, traversal sequences,
-    drive prefixes, control characters, trailing dots/spaces, and Windows
-    device names must not survive into the on-disk filename.
+    drive prefixes, control characters, trailing dots/spaces, over-long names,
+    and Windows device names must not survive into the on-disk filename.
     """
 
     if name:
         # PureWindowsPath treats both / and \ as separators and drops any
         # drive/UNC prefix, so "../../x", "C:x", and "\\host\x" all reduce to the
         # final component regardless of the platform this code runs on.
-        candidate = _scrub_filename_component(PureWindowsPath(name).name)
-        if candidate and candidate.split(".")[0].upper() not in _WINDOWS_RESERVED_NAMES:
+        candidate = _truncate_filename(_scrub_filename_component(PureWindowsPath(name).name))
+        if candidate:
+            # Prefix reserved device names (CON, NUL, ...) rather than discard the
+            # name: "_aux.pdf" keeps the user's filename while staying writable.
+            if candidate.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+                candidate = "_" + candidate
             return candidate
     return build_asset_filename(message_id, index, mime_type)
 

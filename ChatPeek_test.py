@@ -16,10 +16,12 @@ from ChatPeek import (
     Reply,
     ReplyType,
     ShareAccessError,
+    _AssetNamer,
     _extract_scripts,
     author_name_for_role,
     build_asset_filename,
     decode_loader,
+    default_http_get,
     extract_loader_payload,
     fetch_share_page,
     flatten_message_content,
@@ -1331,10 +1333,20 @@ class SanitizeAssetFilenameTests(unittest.TestCase):
     def test_leading_dot_preserved(self) -> None:
         self.assertEqual(sanitize_asset_filename(".env", "msg-1", 0, None), ".env")
 
-    def test_windows_reserved_name_falls_back(self) -> None:
-        for reserved in ("NUL", "con", "NUL.txt", "COM1.log"):
-            result = sanitize_asset_filename(reserved, "msg-1", 3, "text/plain")
-            self.assertEqual(result, build_asset_filename("msg-1", 3, "text/plain"))
+    def test_windows_reserved_name_is_prefixed(self) -> None:
+        # Reserved device names are prefixed (not discarded), staying writable on
+        # every platform while preserving the user's filename.
+        self.assertEqual(sanitize_asset_filename("NUL", "msg-1", 3, None), "_NUL")
+        self.assertEqual(sanitize_asset_filename("con", "msg-1", 3, None), "_con")
+        self.assertEqual(sanitize_asset_filename("NUL.txt", "msg-1", 3, None), "_NUL.txt")
+        self.assertEqual(sanitize_asset_filename("COM1.log", "msg-1", 3, None), "_COM1.log")
+        # The prefixed form is no longer reserved.
+        self.assertNotIn("_NUL".split(".")[0].upper(), {"NUL"})
+
+    def test_overlong_name_truncated(self) -> None:
+        result = sanitize_asset_filename("a" * 5000 + ".txt", "msg-1", 0, None)
+        self.assertLessEqual(len(result), 200)
+        self.assertTrue(result.endswith(".txt"))
 
 
 class AssetSecurityTests(unittest.TestCase):
@@ -1447,11 +1459,156 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertFalse((md_path.parent / "attachments" / "report.csv").exists())
 
     @mock.patch("requests.get")
-    def test_default_http_get_disables_redirects(self, mock_get: mock.Mock) -> None:
-        from ChatPeek import default_http_get
-
+    def test_default_http_get_does_not_auto_follow_redirects(self, mock_get: mock.Mock) -> None:
+        ok = mock.Mock(spec=requests.Response)
+        ok.is_redirect = False
+        mock_get.return_value = ok
         default_http_get("https://files.oaiusercontent.com/x")
+        # Redirects are resolved manually, never by requests' auto-follow.
         self.assertFalse(mock_get.call_args.kwargs["allow_redirects"])
+
+    @mock.patch("requests.get")
+    def test_default_http_get_follows_allowed_redirect(self, mock_get: mock.Mock) -> None:
+        # 302 from an allowed host to another allowed host is followed to the 200.
+        redirect = mock.Mock(spec=requests.Response)
+        redirect.is_redirect = True
+        redirect.headers = {"Location": "https://oaidalleapiprodscus.blob.core.windows.net/img.png"}
+        final = mock.Mock(spec=requests.Response)
+        final.is_redirect = False
+        final.status_code = 200
+        mock_get.side_effect = [redirect, final]
+        result = default_http_get("https://chatgpt.com/backend-api/files/x/download")
+        self.assertIs(result, final)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
+    def test_default_http_get_refuses_off_allowlist_redirect(self, mock_get: mock.Mock) -> None:
+        # 302 toward an internal address is NOT followed — the request to the
+        # internal host is never made, and the redirect response is returned as-is.
+        redirect = mock.Mock(spec=requests.Response)
+        redirect.is_redirect = True
+        redirect.status_code = 302
+        redirect.headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+        mock_get.return_value = redirect
+        result = default_http_get("https://chatgpt.com/backend-api/files/x/download")
+        self.assertIs(result, redirect)
+        self.assertEqual(mock_get.call_count, 1)  # internal host never requested
+
+    def test_malformed_host_does_not_abort_export(self) -> None:
+        # "https://.openai.com/x" passes the allowlist but requests raises
+        # InvalidURL; the export must still complete instead of crashing.
+        def boom(url: str) -> requests.Response:
+            raise requests.exceptions.InvalidURL("URL has an invalid label")
+
+        reply = Reply(
+            author_name="User",
+            type=ReplyType.HUMAN,
+            statement="Hello",
+            assets=[
+                ConversationAsset(
+                    asset_type="file",
+                    url="https://.openai.com/x",
+                    filename="x.bin",
+                    downloadable=True,
+                )
+            ],
+        )
+        chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp), download_assets=True, http_get=boom)
+            self.assertTrue(md_path.exists())
+            self.assertFalse((md_path.parent / "attachments" / "x.bin").exists())
+
+    def test_save_markdown_downloads_image_asset_into_images_dir(self) -> None:
+        # Covers the asset_type="image" branch: routing to images/ and the
+        # resolved_parents[True] containment key.
+        reply = Reply(
+            author_name="User",
+            type=ReplyType.HUMAN,
+            statement="Hello",
+            assets=[
+                ConversationAsset(
+                    asset_type="image",
+                    url="https://files.oaiusercontent.com/pic.png",
+                    filename="pic.png",
+                    downloadable=True,
+                )
+            ],
+        )
+        chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+        resp = mock.Mock(spec=requests.Response)
+        resp.status_code = 200
+        resp.content = b"PNGDATA"
+        resp.raise_for_status.return_value = None
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp), download_assets=True, http_get=lambda url: resp)
+            self.assertTrue((md_path.parent / "images" / "pic.png").exists())
+            self.assertFalse((md_path.parent / "attachments" / "pic.png").exists())
+
+    def test_save_markdown_refuses_absolute_and_drive_filenames(self) -> None:
+        http_get = mock.Mock()
+        for bad in ("C:\\evil.txt", "\\\\host\\share\\evil.txt", "/etc/evil.txt"):
+            reply = Reply(
+                author_name="User",
+                type=ReplyType.HUMAN,
+                statement="Hello",
+                assets=[
+                    ConversationAsset(
+                        asset_type="file",
+                        url="https://files.oaiusercontent.com/x",
+                        filename=bad,
+                        downloadable=True,
+                    )
+                ],
+            )
+            chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+            with tempfile.TemporaryDirectory() as tmp:
+                chat.save_markdown(Path(tmp), download_assets=True, http_get=http_get)
+                # Nothing written outside the two export subdirectories.
+                escaped = [p for p in Path(tmp).rglob("evil.txt")
+                           if p.parent.name not in ("images", "attachments")]
+                self.assertEqual(escaped, [])
+
+
+class AssetNamerTests(unittest.TestCase):
+    def test_same_url_reuses_one_filename(self) -> None:
+        namer = _AssetNamer()
+        first = namer.assign("https://x/a", "report.csv")
+        second = namer.assign("https://x/a", "report.csv")
+        self.assertEqual(first, second)
+
+    def test_distinct_urls_same_name_disambiguated(self) -> None:
+        namer = _AssetNamer()
+        self.assertEqual(namer.assign("https://x/1", "report.csv"), "report.csv")
+        self.assertEqual(namer.assign("https://x/2", "report.csv"), "report-1.csv")
+        self.assertEqual(namer.assign("https://x/3", "report.csv"), "report-2.csv")
+
+    def test_disambiguation_without_extension(self) -> None:
+        namer = _AssetNamer()
+        self.assertEqual(namer.assign("https://x/1", "data"), "data")
+        self.assertEqual(namer.assign("https://x/2", "data"), "data-1")
+
+    def test_colliding_attachment_names_stay_distinct_in_export(self) -> None:
+        # Two attachments with the same name but different URLs must both be
+        # downloaded to distinct files, with distinct Markdown links.
+        namer = _AssetNamer()
+        message_a: Dict[str, Any] = {
+            "id": "m-a",
+            "content": {"content_type": "text", "parts": ["A"]},
+            "metadata": {"attachments": [
+                {"download_url": "https://files.oaiusercontent.com/one", "name": "report.csv"}
+            ]},
+        }
+        message_b: Dict[str, Any] = {
+            "id": "m-b",
+            "content": {"content_type": "text", "parts": ["B"]},
+            "metadata": {"attachments": [
+                {"download_url": "https://files.oaiusercontent.com/two", "name": "report.csv"}
+            ]},
+        }
+        _, assets_a = flatten_message_content("m-a", message_a["content"], message_a, namer)
+        _, assets_b = flatten_message_content("m-b", message_b["content"], message_b, namer)
+        self.assertNotEqual(assets_a[0].filename, assets_b[0].filename)
 
 
 if __name__ == "__main__":
