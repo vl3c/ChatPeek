@@ -1,12 +1,16 @@
 import json
+import os
 import re
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, cast
 from unittest import mock
 
 import requests
+
+from check_fixture_links import FIXTURE_LINKS, check_fixture_link
 
 from ChatPeek import (
     Chat,
@@ -43,6 +47,10 @@ from ChatPeek import (
 
 FIXTURES: Path = Path(__file__).resolve().parent / "fixtures"
 SHARE_FIXTURE: Path = FIXTURES / "690781ed-75f0-8006-9d6e-d9229bd932f2.html"
+# A varied conversation (many turns, multi-language code blocks, nested
+# Markdown) captured as HTML so the tests keep exercising those paths even
+# after the live share link expires.
+VARIED_FIXTURE: Path = FIXTURES / "69b1c492-1540-8006-aa29-ee2e0a831385.html"
 
 
 class ChatPeekModuleTests(unittest.TestCase):
@@ -1584,6 +1592,72 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
             self.assertEqual(len(md_files), 1)
             content = md_files[0].read_text(encoding="utf-8")
             self.assertIn("Gigawatt", content)
+
+
+class VariedShareFixtureTests(unittest.TestCase):
+    """Coverage over a share export whose content is deliberately varied:
+    many alternating turns, multi-language code blocks, and Markdown nested
+    inside assistant messages."""
+
+    def setUp(self) -> None:
+        self.html: str = VARIED_FIXTURE.read_text(encoding="utf-8")
+
+    def test_dispatcher_routes_to_modern_share(self) -> None:
+        chat = parse_share_html(self.html)
+        self.assertEqual(chat.share_id, "69b1c492-1540-8006-aa29-ee2e0a831385")
+        self.assertEqual(chat.title, "Hybrid Cognitive Systems")
+
+    def test_alternating_user_and_assistant_turns(self) -> None:
+        chat = parse_modern_share(self.html)
+        self.assertEqual(len(chat.replies), 15)
+        roles = [reply.type for reply in chat.replies]
+        self.assertEqual(roles.count(ReplyType.HUMAN), 8)
+        self.assertEqual(roles.count(ReplyType.AI), 7)
+
+    def test_preserves_multi_language_code_blocks(self) -> None:
+        markdown = parse_modern_share(self.html).to_markdown()
+        self.assertIn("```cpp", markdown)
+        self.assertIn("#include <iostream>", markdown)
+        self.assertIn("```html", markdown)
+        self.assertIn("```md", markdown)
+
+    def test_preserves_markdown_nested_in_assistant_message(self) -> None:
+        markdown = parse_modern_share(self.html).to_markdown()
+        self.assertIn("# Heading 1", markdown)
+
+    def test_markdown_has_no_citation_tokens(self) -> None:
+        markdown = parse_modern_share(self.html).to_markdown()
+        self.assertNotIn("citeturn", markdown)
+
+    def test_save_markdown_uses_title_and_share_id_for_filename(self) -> None:
+        chat = parse_modern_share(self.html)
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp), download_assets=False)
+            self.assertTrue(md_path.exists())
+            self.assertEqual(md_path.name, "hybrid-cognitive-systems-69b1c492.md")
+
+
+@unittest.skipUnless(
+    os.environ.get("CHATPEEK_CHECK_LINKS"),
+    "network liveness check; set CHATPEEK_CHECK_LINKS=1 to run",
+)
+class FixtureLinkLivenessTests(unittest.TestCase):
+    """Opt-in network check: warn and fail when a fixture's backing share link
+    has gone stale, so a maintainer is told to mint a replacement. Skipped by
+    default so the normal suite stays offline and deterministic."""
+
+    def test_backing_share_links_are_live(self) -> None:
+        problems: List[str] = []
+        for link in FIXTURE_LINKS:
+            result = check_fixture_link(link)
+            if result.message is not None:
+                warnings.warn(result.message, stacklevel=2)
+            # Only a genuinely stale link is a failure; inconclusive checks
+            # (network error, rate limit, bot challenge) must not fail the run.
+            if result.status == "stale":
+                problems.append(result.message or link.fixture)
+        if problems:
+            self.fail("\n\n".join(problems))
 
 
 class IsAllowedAssetUrlTests(unittest.TestCase):
