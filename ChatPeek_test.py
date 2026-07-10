@@ -163,6 +163,34 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertEqual(chat.share_id, "t_post456")
         self.assertEqual(chat.title, "Post Route")
 
+    def test_parse_post_share_raises_without_post_route(self) -> None:
+        html = self._build_loader_html(
+            {"loaderData": {"routes/share.$shareId.($action)": {}}}
+        )
+
+        with self.assertRaises(ValueError):
+            parse_post_share(html)
+
+    def test_parse_post_share_raises_when_loader_data_not_mapping(self) -> None:
+        html = self._build_loader_html({"loaderData": "routes/s.$postId"})
+
+        with self.assertRaises(ValueError):
+            parse_post_share(html)
+
+    def test_parse_post_share_tolerates_non_mapping_post(self) -> None:
+        html = self._build_loader_html(
+            {
+                "loaderData": {
+                    "routes/s.$postId": {"postWithProfile": {"post": ["bogus"]}}
+                }
+            }
+        )
+
+        chat = parse_post_share(html)
+
+        self.assertEqual(chat.share_id, "shared")
+        self.assertEqual(chat.replies, [])
+
     def test_flatten_message_content_formats_text(self) -> None:
         message: Dict[str, Any] = {
             "id": "abc",

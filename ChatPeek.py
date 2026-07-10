@@ -209,7 +209,7 @@ def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout
                 "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
             ) from exc
         raise
-    return cast(str, response.text)
+    return response.text
 
 
 def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
@@ -378,10 +378,18 @@ def parse_post_share(html: str) -> Chat:
         raise ValueError("Post share payload not found")
 
     decoded = decode_loader(loader)
-    loader_data = cast(Mapping[str, Any], decoded.get("loaderData", {}))
-    route = cast(Mapping[str, Any], loader_data.get("routes/s.$postId", {}))
-    post_with_profile = cast(Mapping[str, Any], route.get("postWithProfile", {}))
-    post = cast(Mapping[str, Any], post_with_profile.get("post", {}))
+    loader_data = decoded.get("loaderData")
+    if not isinstance(loader_data, Mapping):
+        raise ValueError("Post share route not found")
+    route = loader_data.get("routes/s.$postId")
+    if not isinstance(route, Mapping):
+        raise ValueError("Post share route not found")
+    post_with_profile_raw = route.get("postWithProfile")
+    post_with_profile: Mapping[str, Any] = (
+        post_with_profile_raw if isinstance(post_with_profile_raw, Mapping) else {}
+    )
+    post_raw = post_with_profile.get("post")
+    post: Mapping[str, Any] = post_raw if isinstance(post_raw, Mapping) else {}
     share_id_value = post.get("id")
     share_id = share_id_value if isinstance(share_id_value, str) else "shared"
     title_value = post.get("text")
@@ -520,8 +528,8 @@ def parse_share_html(html: str) -> Chat:
     loader = extract_loader_payload(html)
     if loader is not None:
         decoded = decode_loader(loader)
-        loader_data = cast(Mapping[str, Any], decoded.get("loaderData", {}))
-        if "routes/s.$postId" in loader_data:
+        loader_data = decoded.get("loaderData")
+        if isinstance(loader_data, Mapping) and "routes/s.$postId" in loader_data:
             return parse_post_share(html)
 
     try:
