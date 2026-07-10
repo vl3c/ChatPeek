@@ -11,6 +11,7 @@ import requests
 from ChatPeek import (
     Chat,
     ChatPeek,
+    ExportOptions,
     ConversationAsset,
     JsonValue,
     Reply,
@@ -29,6 +30,7 @@ from ChatPeek import (
     parse_post_share,
     parse_share_html,
     slugify_title,
+    is_tool_addressed,
     strip_private_use,
     strip_citation_tokens,
     summarize_tool_payload,
@@ -64,7 +66,17 @@ class ChatPeekModuleTests(unittest.TestCase):
         self.assertIsInstance(chat, Chat)
         self.assertEqual(chat.share_id, "690781ed-75f0-8006-9d6e-d9229bd932f2")
         self.assertIn("Gigawatt", chat.title)
-        self.assertGreater(len(chat.replies), 10)
+        # Default export keeps only user-visible replies (5 user + 4 assistant).
+        self.assertEqual(len(chat.replies), 9)
+        full = parse_modern_share(
+            self.html,
+            ExportOptions(
+                include_reasoning=True,
+                include_tool_output=True,
+                include_model_context=True,
+            ),
+        )
+        self.assertGreater(len(full.replies), len(chat.replies))
 
     def test_parse_post_share_returns_message_slice_and_widget_report(self) -> None:
         report_message = {
@@ -139,6 +151,89 @@ class ChatPeekModuleTests(unittest.TestCase):
         ])
         self.assertIn("Find the implementation", chat.to_markdown())
         self.assertIn("Deep Research Report", chat.to_markdown())
+
+    def test_parse_post_share_respects_export_options(self) -> None:
+        html = self._build_loader_html(
+            {
+                "loaderData": {
+                    "routes/s.$postId": {
+                        "postWithProfile": {
+                            "post": {
+                                "id": "t_post789",
+                                "posted_at": 1777152234.0,
+                                "text": "Post Share",
+                                "attachments": [
+                                    {
+                                        "kind": "message_slice",
+                                        "messages": [
+                                            {
+                                                "id": "thought-message",
+                                                "author": {"role": "assistant", "metadata": {}},
+                                                "create_time": 1777134625.0,
+                                                "content": {
+                                                    "content_type": "thoughts",
+                                                    "thoughts": [
+                                                        {"summary": "Secret reasoning"}
+                                                    ],
+                                                },
+                                                "metadata": {},
+                                            },
+                                            {
+                                                "id": "tool-call",
+                                                "author": {"role": "assistant", "metadata": {}},
+                                                "recipient": "web",
+                                                "create_time": 1777134626.0,
+                                                "content": {
+                                                    "content_type": "code",
+                                                    "text": 'search("internal query")',
+                                                },
+                                                "metadata": {},
+                                            },
+                                            {
+                                                "id": "redacted-tool",
+                                                "author": {"role": "tool", "metadata": {}},
+                                                "create_time": 1777134627.0,
+                                                "content": {
+                                                    "content_type": "text",
+                                                    "parts": [
+                                                        "The output of this plugin was redacted."
+                                                    ],
+                                                },
+                                                "metadata": {},
+                                            },
+                                            {
+                                                "id": "answer",
+                                                "author": {"role": "assistant", "metadata": {}},
+                                                "create_time": 1777134628.0,
+                                                "content": {
+                                                    "content_type": "text",
+                                                    "parts": ["Visible answer"],
+                                                },
+                                                "metadata": {},
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        default_markdown = parse_post_share(html).to_markdown()
+        self.assertIn("Visible answer", default_markdown)
+        self.assertNotIn("Secret reasoning", default_markdown)
+        self.assertNotIn("internal query", default_markdown)
+        self.assertNotIn("The output of this plugin was redacted.", default_markdown)
+
+        full_markdown = parse_post_share(
+            html,
+            ExportOptions(include_reasoning=True, include_tool_output=True),
+        ).to_markdown()
+        self.assertIn("Secret reasoning", full_markdown)
+        self.assertIn("internal query", full_markdown)
+        self.assertNotIn("The output of this plugin was redacted.", full_markdown)
 
     def test_parse_share_html_prefers_post_share_route(self) -> None:
         html = self._build_loader_html(
@@ -336,10 +431,32 @@ class ChatPeekModuleTests(unittest.TestCase):
         markdown = chat.to_markdown()
         self.assertNotIn("response_length", markdown)
 
-    def test_chat_markdown_summarizes_tool_queries(self) -> None:
+    def test_chat_markdown_omits_internal_reasoning_by_default(self) -> None:
         chat = parse_modern_share(self.html)
         markdown = chat.to_markdown()
+        self.assertNotIn("Thought for a couple of seconds", markdown)
+        self.assertNotIn("Search tool invoked with queries:", markdown)
+        self.assertNotIn("The output of this plugin was redacted.", markdown)
+        # Non-JSON tool invocations (e.g. search("...") addressed to the web
+        # tool) must be hidden too, not just JSON payloads.
+        self.assertNotIn("search(", markdown)
+        self.assertNotIn("search_query", markdown)
+
+    def test_parse_share_html_can_include_internal_content(self) -> None:
+        chat = parse_share_html(
+            self.html,
+            ExportOptions(
+                include_reasoning=True,
+                include_tool_output=True,
+                include_model_context=True,
+            ),
+        )
+        markdown = chat.to_markdown()
+        self.assertIn("Thinking longer for a better answer", markdown)
+        self.assertIn("Original custom instructions no longer available", markdown)
         self.assertIn("Search tool invoked with queries:", markdown)
+        self.assertNotIn("The output of this plugin was redacted.", markdown)
+        self.assertIn("Thought for 40s", markdown)
 
     def test_markdown_preserves_useful_content(self) -> None:
         chat = parse_modern_share(self.html)
@@ -391,7 +508,13 @@ class ChatPeekModuleTests(unittest.TestCase):
             content = message.get("content")
             if not isinstance(content, Mapping):
                 continue
+            author_info = message.get("author") or {}
+            role = author_info.get("role") if isinstance(author_info, Mapping) else None
             ctype = content.get("content_type")
+            if role == "tool":
+                continue
+            if is_tool_addressed(message):
+                continue
             if ctype == "text":
                 parts = content.get("parts", [])
                 if isinstance(parts, list):
@@ -404,25 +527,6 @@ class ChatPeekModuleTests(unittest.TestCase):
             elif ctype == "code":
                 text = content.get("text")
                 if isinstance(text, str):
-                    try:
-                        maybe_json = json.loads(text)
-                    except json.JSONDecodeError:
-                        maybe_json = None
-                    if isinstance(maybe_json, Mapping):
-                        search_queries = maybe_json.get("search_query")
-                        if isinstance(search_queries, list):
-                            for entry in search_queries:
-                                if isinstance(entry, Mapping):
-                                    query = entry.get("q")
-                                    if isinstance(query, str) and query.strip():
-                                        cleaned_query = self._clean_segment(query.strip())
-                                        if cleaned_query:
-                                            segments.append(cleaned_query)
-                                elif isinstance(entry, str) and entry.strip():
-                                    cleaned_entry = self._clean_segment(entry.strip())
-                                    if cleaned_entry:
-                                        segments.append(cleaned_entry)
-                        continue
                     if text.strip():
                         cleaned_text = self._clean_segment(text.strip())
                         if cleaned_text:
@@ -740,6 +844,16 @@ class SummarizeToolPayloadTests(unittest.TestCase):
         # Only 1 bullet for the valid query
         self.assertEqual(result.count("- "), 1)
 
+    def test_detects_tool_addressed_messages(self) -> None:
+        self.assertTrue(is_tool_addressed({"recipient": "web"}))
+        self.assertTrue(is_tool_addressed({"recipient": "web.run"}))
+        self.assertTrue(is_tool_addressed({"recipient": "python"}))
+        self.assertFalse(is_tool_addressed({"recipient": "all"}))
+        self.assertFalse(is_tool_addressed({"recipient": ""}))
+        self.assertFalse(is_tool_addressed({"recipient": None}))
+        self.assertFalse(is_tool_addressed({"recipient": 42}))
+        self.assertFalse(is_tool_addressed({}))
+
 
 class BuildAssetFilenameTests(unittest.TestCase):
     def test_basic_filename(self) -> None:
@@ -834,6 +948,58 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
         text, _ = flatten_message_content("m1", message["content"], message)
         self.assertEqual(text, "")
 
+    def test_code_addressed_to_tool_is_omitted_by_default(self) -> None:
+        payload = json.dumps({"open": [{"ref_id": "abc"}], "response_length": 500})
+        message: Dict[str, Any] = {
+            "id": "m1",
+            "recipient": "browser",
+            "content": {"content_type": "code", "language": "json", "text": payload},
+            "metadata": {},
+        }
+        text, _ = flatten_message_content("m1", message["content"], message)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_tool_output=True),
+        )
+        self.assertIn("open", included_text)
+
+    def test_non_json_code_addressed_to_tool_is_omitted_by_default(self) -> None:
+        message: Dict[str, Any] = {
+            "id": "m1",
+            "recipient": "web",
+            "content": {"content_type": "code", "text": 'search("secret query")'},
+            "metadata": {},
+        }
+        text, _ = flatten_message_content("m1", message["content"], message)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_tool_output=True),
+        )
+        self.assertIn('search("secret query")', included_text)
+
+    def test_user_visible_json_code_block_is_preserved(self) -> None:
+        # A legitimate assistant JSON example whose keys look tool-ish
+        # (open, input, file) must survive the export untouched.
+        payload = json.dumps({"open": True, "input": "hello", "file": "config.yaml"})
+        message: Dict[str, Any] = {
+            "id": "m1",
+            "recipient": "all",
+            "content": {"content_type": "code", "language": "json", "text": payload},
+            "metadata": {},
+        }
+        text, _ = flatten_message_content("m1", message["content"], message)
+        self.assertIn('"input": "hello"', text)
+        self.assertIn('"file": "config.yaml"', text)
+        self.assertIn("```json", text)
+
     def test_thoughts_content_type(self) -> None:
         message: Dict[str, Any] = {
             "id": "m1",
@@ -847,8 +1013,16 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Thinking: about this problem", text)
-        self.assertIn("Considering: alternatives", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Thinking: about this problem", included_text)
+        self.assertIn("Considering: alternatives", included_text)
 
     def test_thoughts_with_only_summary(self) -> None:
         message: Dict[str, Any] = {
@@ -860,7 +1034,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Just a summary", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Just a summary", included_text)
 
     def test_reasoning_recap_content_type(self) -> None:
         message: Dict[str, Any] = {
@@ -869,7 +1051,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertIn("Recap of reasoning", text)
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_reasoning=True),
+        )
+        self.assertIn("Recap of reasoning", included_text)
 
     def test_reasoning_recap_empty(self) -> None:
         message: Dict[str, Any] = {
@@ -887,7 +1077,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertEqual(text, "Custom instructions here")
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_model_context=True),
+        )
+        self.assertEqual(included_text, "Custom instructions here")
 
     def test_tool_response_strips_private_use(self) -> None:
         message: Dict[str, Any] = {
@@ -896,7 +1094,15 @@ class FlattenMessageContentEdgeCases(unittest.TestCase):
             "metadata": {},
         }
         text, _ = flatten_message_content("m1", message["content"], message)
-        self.assertEqual(text, "Resulthere")
+        self.assertEqual(text, "")
+
+        included_text, _ = flatten_message_content(
+            "m1",
+            message["content"],
+            message,
+            ExportOptions(include_tool_output=True),
+        )
+        self.assertEqual(included_text, "Resulthere")
 
     def test_unknown_content_type_with_parts_fallback(self) -> None:
         message: Dict[str, Any] = {
