@@ -54,6 +54,8 @@ The fixtures were captured from real share links, and those links can go dead ov
 python check_fixture_links.py        # exits non-zero and prints guidance if any link is stale
 ```
 
+A link that is genuinely gone (or whose content changed) is reported as stale and fails the check. A transient problem — a network error, rate limit, or bot challenge, which datacenter CI runners hitting ChatGPT sometimes get — is reported as inconclusive and does *not* fail, so the weekly check does not raise false alarms.
+
 If a link is stale, the output tells you how to mint a replacement — including a ready-to-paste prompt that makes an AI chat generate a suitably varied conversation — and how to re-capture the fixture:
 
 ```bash

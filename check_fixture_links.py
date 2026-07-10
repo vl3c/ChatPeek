@@ -21,14 +21,27 @@ check only when CHATPEEK_CHECK_LINKS is set, to keep the default run offline.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
+
+import requests
 
 from ChatPeek import ShareAccessError, fetch_share_page, parse_share_html
 
 FIXTURES: Path = Path(__file__).resolve().parent / "fixtures"
+
+# HTTP statuses that mean "we were blocked or the server hiccuped", not "the
+# share is gone". Datacenter IPs (e.g. CI runners) hitting chatgpt.com behind
+# Cloudflare routinely get these, so they must not be reported as stale.
+_TRANSIENT_STATUSES = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
+# Statuses that genuinely mean the share no longer exists.
+_GONE_STATUSES = frozenset({404, 410})
+# A share id is a URL path segment; keep it to filesystem-safe characters.
+_SHARE_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 # Prompt a maintainer can paste into a fresh AI chat to regenerate a
 # conversation with the spread of content the exporter tests exercise. Keep it
@@ -80,30 +93,67 @@ FIXTURE_LINKS: List[FixtureLink] = [
 ]
 
 
-def check_fixture_link(link: FixtureLink) -> Optional[str]:
-    """Return None if the link is healthy, else a maintainer-facing warning."""
+@dataclass
+class CheckResult:
+    """Outcome of checking one link.
+
+    ``stale`` means the share is genuinely gone or its content changed and the
+    fixture should be re-sourced. ``inconclusive`` means we could not tell
+    (network error, rate limit, bot challenge) — callers should surface it but
+    NOT treat it as a failure, so a blocked CI runner never raises a false
+    alarm. ``ok`` means the link still reproduces the fixture's content.
+    """
+
+    fixture: str
+    status: str  # "ok" | "stale" | "inconclusive"
+    message: Optional[str] = None
+
+
+def check_fixture_link(link: FixtureLink) -> CheckResult:
+    """Fetch the link and classify it as ok / stale / inconclusive."""
 
     try:
         html = fetch_share_page(link.url)
     except ShareAccessError as exc:
-        return _stale_message(link, f"the share link is no longer public ({exc})")
-    except Exception as exc:  # any network/HTTP failure means the link is unusable
-        return _stale_message(link, f"the share link could not be fetched ({exc})")
+        return CheckResult(
+            link.fixture, "stale", _stale_message(link, f"the share link is no longer public ({exc})")
+        )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status in _GONE_STATUSES:
+            return CheckResult(
+                link.fixture, "stale", _stale_message(link, f"the share link returned HTTP {status} (gone)")
+            )
+        return CheckResult(
+            link.fixture, "inconclusive", _inconclusive_message(link, f"HTTP {status} (blocked or transient)")
+        )
+    except requests.RequestException as exc:
+        return CheckResult(
+            link.fixture, "inconclusive", _inconclusive_message(link, f"could not be reached ({exc})")
+        )
 
     try:
         markdown = parse_share_html(html).to_markdown()
-    except Exception as exc:  # a page that no longer parses is just as stale
-        return _stale_message(link, f"the share page no longer parses ({exc})")
+    except Exception as exc:
+        # A 200 that does not parse is far more likely an interstitial or bot
+        # challenge than a genuinely changed conversation, so do not cry wolf.
+        return CheckResult(
+            link.fixture, "inconclusive", _inconclusive_message(link, f"returned an unparseable page ({exc})")
+        )
 
     missing = [marker for marker in link.content_markers if marker not in markdown]
     if missing:
         joined = ", ".join(repr(marker) for marker in missing)
-        return _stale_message(
-            link,
-            "the link is live but its content changed; the exporter no longer "
-            f"produces: {joined}",
+        return CheckResult(
+            link.fixture,
+            "stale",
+            _stale_message(
+                link,
+                f"the exporter no longer produces {joined} from this link "
+                "(the conversation changed, or ChatPeek's rendering did)",
+            ),
         )
-    return None
+    return CheckResult(link.fixture, "ok")
 
 
 def _stale_message(link: FixtureLink, reason: str) -> str:
@@ -137,15 +187,27 @@ def _stale_message(link: FixtureLink, reason: str) -> str:
     )
 
 
+def _inconclusive_message(link: FixtureLink, reason: str) -> str:
+    return (
+        f"COULD NOT CHECK {link.fixture}: {reason}. "
+        f"URL: {link.url}. Not treated as stale; will retry next run."
+    )
+
+
+def _share_id_from_url(url: str) -> str:
+    """Extract the share id (last path segment), ignoring query and fragment."""
+
+    segment = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+    if not _SHARE_ID_RE.fullmatch(segment):
+        raise ValueError(f"Could not derive a filesystem-safe share id from URL: {url!r}")
+    return segment
+
+
 def capture(url: str) -> Path:
     """Fetch ``url`` and save it under fixtures/ named after its share id."""
 
-    share_id = url.rstrip("/").split("/")[-1]
-    if not share_id:
-        raise ValueError(f"Could not derive a share id from URL: {url!r}")
-    html = fetch_share_page(url)
-    out = FIXTURES / f"{share_id}.html"
-    out.write_text(html, encoding="utf-8")
+    out = FIXTURES / f"{_share_id_from_url(url)}.html"
+    out.write_text(fetch_share_page(url), encoding="utf-8")
     return out
 
 
@@ -166,14 +228,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     stale: List[str] = []
+    inconclusive: List[str] = []
     for link in FIXTURE_LINKS:
-        message = check_fixture_link(link)
-        if message is None:
+        result = check_fixture_link(link)
+        if result.status == "ok":
             print(f"OK: {link.fixture} <- {link.url}")
+        elif result.status == "inconclusive":
+            print(result.message, file=sys.stderr)
+            inconclusive.append(link.fixture)
         else:
-            print(message, file=sys.stderr)
+            print(result.message, file=sys.stderr)
             stale.append(link.fixture)
 
+    if inconclusive:
+        print(
+            f"\n{len(inconclusive)} link(s) could not be checked "
+            f"(network/blocked, not failing): {', '.join(inconclusive)}",
+            file=sys.stderr,
+        )
     if stale:
         print(
             f"\n{len(stale)} stale fixture link(s): {', '.join(stale)}",

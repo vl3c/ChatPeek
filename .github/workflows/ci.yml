@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Only push to the default branch, so a feature branch with an open PR is
+  # checked once via pull_request instead of twice (push + pull_request).
   push:
+    branches: [master]
   pull_request:
   schedule:
     # Weekly liveness check so a stale fixture link surfaces on its own.
@@ -12,7 +15,7 @@ on:
 jobs:
   test:
     # Offline unit tests: replay saved fixtures, no network.
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

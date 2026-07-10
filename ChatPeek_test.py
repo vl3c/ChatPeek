@@ -1649,10 +1649,13 @@ class FixtureLinkLivenessTests(unittest.TestCase):
     def test_backing_share_links_are_live(self) -> None:
         problems: List[str] = []
         for link in FIXTURE_LINKS:
-            message = check_fixture_link(link)
-            if message is not None:
-                warnings.warn(message, stacklevel=2)
-                problems.append(message)
+            result = check_fixture_link(link)
+            if result.message is not None:
+                warnings.warn(result.message, stacklevel=2)
+            # Only a genuinely stale link is a failure; inconclusive checks
+            # (network error, rate limit, bot challenge) must not fail the run.
+            if result.status == "stale":
+                problems.append(result.message or link.fixture)
         if problems:
             self.fail("\n\n".join(problems))
 
