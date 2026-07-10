@@ -67,6 +67,10 @@ class FixtureLink:
         return FIXTURES / self.fixture
 
 
+# Only links we still expect to be live belong here. The other fixture,
+# 690781ed-...html, was captured from a share link that is no longer public;
+# it is kept purely as a frozen snapshot for the tests, so there is nothing to
+# re-source and it is deliberately not liveness-checked.
 FIXTURE_LINKS: List[FixtureLink] = [
     FixtureLink(
         fixture="69b1c492-1540-8006-aa29-ee2e0a831385.html",

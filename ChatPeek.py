@@ -10,9 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from html.parser import HTMLParser
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
-from urllib.parse import urlparse
+from pathlib import Path, PureWindowsPath
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -37,6 +37,47 @@ DEFAULT_HEADERS: Dict[str, str] = {
 
 
 EXPORT_ROOT: Path = Path("Exports")
+
+# Hosts ChatGPT/OpenAI serve conversation assets from. Asset URLs come from the
+# untrusted share page, so downloads are limited to these hosts (or their
+# subdomains); anything else is rendered as a placeholder instead of being
+# fetched. This is the initial-URL half of the SSRF defense; default_http_get
+# also refuses to follow redirects so an allowed host cannot bounce the fetch
+# to an internal address.
+ALLOWED_ASSET_HOST_SUFFIXES: Tuple[str, ...] = (
+    "oaiusercontent.com",
+    "oaistatic.com",
+    "chatgpt.com",
+    "openai.com",
+    # DALL-E images are served from this OpenAI-owned Azure storage account.
+    # Only this exact account is allowed: matching all of *.blob.core.windows.net
+    # would let a share page point downloads at an attacker's own Azure storage.
+    # Assets on other (newer) OpenAI storage accounts degrade to a placeholder
+    # rather than being fetched — a deliberate security-over-recall tradeoff.
+    "oaidalleapiprodscus.blob.core.windows.net",
+)
+
+_ALLOWED_ASSET_HOST_DOTTED: Tuple[str, ...] = tuple(
+    "." + suffix for suffix in ALLOWED_ASSET_HOST_SUFFIXES
+)
+
+
+def is_allowed_asset_url(url: object) -> bool:
+    """Return True if url is an https link to a known ChatGPT/OpenAI asset host."""
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    # https only: real asset URLs are always https, and requiring it blocks
+    # cleartext fetches an attacker could otherwise steer through an allowed host.
+    if parsed.scheme != "https":
+        return False
+    # rstrip('.') normalizes a fully-qualified "host." form to its bare host.
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in ALLOWED_ASSET_HOST_SUFFIXES or host.endswith(_ALLOWED_ASSET_HOST_DOTTED)
 
 
 class _ScriptCollector(HTMLParser):
@@ -77,6 +118,15 @@ class ReplyType(Enum):
     HUMAN = "user"
     AI = "assistant"
     TOOL = "tool"
+
+
+@dataclass(frozen=True)
+class ExportOptions:
+    """Controls which internal conversation details are included in exports."""
+
+    include_reasoning: bool = False
+    include_tool_output: bool = False
+    include_model_context: bool = False
 
 
 @dataclass
@@ -166,19 +216,35 @@ class Chat:
         if download_assets and needs_folder:
             images_dir = base_dir / "images"
             files_dir = base_dir / "attachments"
+            resolved_parents = {True: images_dir.resolve(), False: files_dir.resolve()}
+            fetch = http_get or default_http_get
             for reply in self.replies:
                 for asset in reply.assets:
-                    target_dir = images_dir if asset.asset_type == "image" else files_dir
-                    target_dir.mkdir(exist_ok=True)
+                    if not asset.downloadable or not is_allowed_asset_url(asset.url):
+                        continue
+                    is_image = asset.asset_type == "image"
+                    target_dir = images_dir if is_image else files_dir
                     target_path = target_dir / asset.filename
-                    if target_path.exists():
+                    try:
+                        # Asset filenames originate from untrusted share-page JSON;
+                        # never write outside the export folder even if a raw
+                        # filename slipped through sanitization.
+                        if target_path.resolve().parent != resolved_parents[is_image]:
+                            continue
+                        target_dir.mkdir(exist_ok=True)
+                        if target_path.exists():
+                            continue
+                        resp = fetch(asset.url)
+                        resp.raise_for_status()
+                        # A non-allowed redirect returns a non-200 status; skip it
+                        # rather than write the redirect body as the asset.
+                        if getattr(resp, "status_code", 200) != 200:
+                            continue
+                        target_path.write_bytes(resp.content)
+                    except (requests.RequestException, OSError):
+                        # One malformed URL or unwritable filename must not abort
+                        # the export of an otherwise-valid conversation.
                         continue
-                    if not asset.downloadable or not asset.url or not asset.url.lower().startswith("http"):
-                        continue
-                    fetch = http_get or default_http_get
-                    resp = fetch(asset.url)
-                    resp.raise_for_status()
-                    target_path.write_bytes(resp.content)
 
         return markdown_path
 
@@ -187,8 +253,34 @@ class ShareAccessError(RuntimeError):
     """Raised when a share URL cannot be fetched due to access restrictions."""
 
 
+_MAX_ASSET_REDIRECTS = 5
+
+
 def default_http_get(url: str) -> requests.Response:
-    return requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+    """Fetch an asset, following redirects only to other allowed asset hosts.
+
+    Redirects are resolved manually (allow_redirects=False) so a hop to an
+    off-allowlist host — e.g. an internal address reached via an open redirect
+    on an allowed host — is refused *before* the request is made. This keeps the
+    SSRF guard intact while still supporting allowed hosts (such as ChatGPT
+    backend file endpoints) that legitimately redirect to a signed blob URL.
+    """
+
+    current = url
+    response = requests.get(current, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
+    for _ in range(_MAX_ASSET_REDIRECTS):
+        if not response.is_redirect:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            return response
+        current = urljoin(current, location)
+        if not is_allowed_asset_url(current):
+            # Refuse to follow a redirect off the allowlist; the caller sees the
+            # non-200 status and skips the asset rather than fetching internally.
+            return response
+        response = requests.get(current, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
+    return response
 
 
 def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> str:
@@ -299,7 +391,8 @@ def decode_loader(loader: List[JsonValue]) -> Dict[str, JsonValue]:
     return resolved
 
 
-def parse_modern_share(html: str) -> Chat:
+def parse_modern_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     loader = extract_loader_payload(html)
     if loader is None:
         raise ValueError("Modern share payload not found")
@@ -329,6 +422,7 @@ def parse_modern_share(html: str) -> Chat:
         else []
     )
 
+    namer = _AssetNamer()
     replies: List[Reply] = []
     for entry in sequence:
         node_id_raw = entry.get("id") if isinstance(entry, Mapping) else None
@@ -352,8 +446,10 @@ def parse_modern_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
         author = author_name_for_role(role)
@@ -372,7 +468,8 @@ def parse_modern_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_post_share(html: str) -> Chat:
+def parse_post_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     loader = extract_loader_payload(html)
     if loader is None:
         raise ValueError("Post share payload not found")
@@ -411,6 +508,7 @@ def parse_post_share(html: str) -> Chat:
                     message for message in raw_messages if isinstance(message, Mapping)
                 )
 
+    namer = _AssetNamer()
     replies: List[Reply] = []
 
     def append_message(message: Mapping[str, Any]) -> None:
@@ -422,8 +520,10 @@ def parse_post_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             return
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
         if not statement and not assets:
+            return
+        if role == "tool" and is_redacted_tool_output(statement):
             return
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
         created_raw = message.get("create_time")
@@ -460,7 +560,8 @@ def parse_post_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model="", title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_legacy_share(html: str) -> Chat:
+def parse_legacy_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     script_content: Optional[str] = None
     for attrs, text in _extract_scripts(html):
         if attrs.get("id") == "__NEXT_DATA__":
@@ -489,6 +590,7 @@ def parse_legacy_share(html: str) -> Chat:
     author_name = author_name_raw if isinstance(author_name_raw, str) else "User"
     sequence = cast(List[Mapping[str, Any]], data.get("linear_conversation", []))
 
+    namer = _AssetNamer()
     replies: List[Reply] = []
     for node in sequence:
         if not isinstance(node, Mapping):
@@ -504,8 +606,10 @@ def parse_legacy_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message)
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         author = author_name if role == "user" else author_name_for_role(role)
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
@@ -524,21 +628,21 @@ def parse_legacy_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_share_html(html: str) -> Chat:
+def parse_share_html(html: str, options: Optional[ExportOptions] = None) -> Chat:
     loader = extract_loader_payload(html)
     if loader is not None:
         decoded = decode_loader(loader)
         loader_data = decoded.get("loaderData")
         if isinstance(loader_data, Mapping) and "routes/s.$postId" in loader_data:
-            return parse_post_share(html)
+            return parse_post_share(html, options)
 
     try:
-        return parse_modern_share(html)
+        return parse_modern_share(html, options)
     except (ValueError, KeyError):
         try:
-            return parse_post_share(html)
+            return parse_post_share(html, options)
         except (ValueError, KeyError):
-            return parse_legacy_share(html)
+            return parse_legacy_share(html, options)
 
 
 def author_name_for_role(role: Optional[str]) -> str:
@@ -592,6 +696,37 @@ def summarize_tool_payload(data: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def message_recipient(message: Mapping[str, Any]) -> Optional[str]:
+    recipient = message.get("recipient")
+    if isinstance(recipient, str) and recipient:
+        return recipient
+    return None
+
+
+def is_tool_addressed(message: Mapping[str, Any]) -> bool:
+    """True when the message is addressed to a tool rather than the user.
+
+    ChatGPT marks user-visible messages with recipient "all"; tool invocations
+    carry the tool name (e.g. "web", "web.run", "python") instead.
+    """
+    recipient = message_recipient(message)
+    return recipient is not None and recipient != "all"
+
+
+def should_include_content(content_type: Optional[str], options: ExportOptions) -> bool:
+    if content_type in {"thoughts", "reasoning_recap"}:
+        return options.include_reasoning
+    if content_type == "tool_response":
+        return options.include_tool_output
+    if content_type == "model_editable_context":
+        return options.include_model_context
+    return True
+
+
+def is_redacted_tool_output(text: str) -> bool:
+    return text.strip().lower() == "the output of this plugin was redacted."
+
+
 def strip_private_use(text: str) -> str:
     return PRIVATE_USE_PATTERN.sub("", text)
 
@@ -610,8 +745,15 @@ def flatten_message_content(
     message_id: Optional[str],
     content: Mapping[str, Any],
     message: Mapping[str, Any],
+    options: Optional[ExportOptions] = None,
+    namer: Optional["_AssetNamer"] = None,
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
+    export_options = options or ExportOptions()
+    if not should_include_content(content_type, export_options):
+        return "", []
+    if is_tool_addressed(message) and not export_options.include_tool_output:
+        return "", []
     assets: List[ConversationAsset] = []
 
     def render_asset_reference(asset: ConversationAsset) -> str:
@@ -644,14 +786,16 @@ def flatten_message_content(
                 mime_str = mime if isinstance(mime, str) else None
                 name_value = attachment_raw.get("name")
                 name = name_value if isinstance(name_value, str) else None
-                filename = name or build_asset_filename(message_id, len(assets), mime_str)
+                filename = sanitize_asset_filename(name, message_id, len(assets), mime_str)
+                if namer is not None:
+                    filename = namer.assign(url, filename)
                 asset_type_raw = (
                     attachment_raw.get("file_type")
                     or attachment_raw.get("type")
                     or "file"
                 )
                 asset_type = asset_type_raw if isinstance(asset_type_raw, str) else "file"
-                downloadable = url.lower().startswith("http")
+                downloadable = is_allowed_asset_url(url)
                 description_raw = attachment_raw.get("title") or attachment_raw.get("name")
                 description = description_raw if isinstance(description_raw, str) else None
                 assets.append(
@@ -701,7 +845,7 @@ def flatten_message_content(
         lang = language if isinstance(language, str) and language != "unknown" else ""
         text_body = code_text if isinstance(code_text, str) else ""
         body = text_body.rstrip("\n")
-        if body:
+        if body and message_recipient(message) != "all":
             try:
                 maybe_json = json.loads(body)
             except json.JSONDecodeError:
@@ -774,8 +918,10 @@ def flatten_message_content(
                     mime_value = part.get("mime_type")
                     mime = mime_value if isinstance(mime_value, str) else None
                     filename = build_asset_filename(message_id, len(assets), mime)
+                    if namer is not None:
+                        filename = namer.assign(pointer_raw, filename)
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
-                    downloadable = pointer_raw.lower().startswith("http")
+                    downloadable = is_allowed_asset_url(pointer_raw)
                     assets.append(
                         ConversationAsset(
                             asset_type=asset_type,
@@ -802,13 +948,124 @@ def flatten_message_content(
     return finalize("")
 
 
+_FILENAME_UNSAFE_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+# Names that resolve to a device rather than a file on Windows.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+# Cap the on-disk name well under the ~255-byte NAME_MAX / MAX_PATH limits so an
+# over-long attacker-supplied name cannot make write_bytes raise OSError. The cap
+# is in bytes (not characters) because NAME_MAX is a byte limit, so a multibyte
+# name (e.g. CJK) is bounded by its UTF-8 length.
+_MAX_FILENAME_BYTES = 200
+
+
+def _truncate_to_bytes(text: str, budget: int) -> str:
+    if budget <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    # errors="ignore" drops a trailing partial multibyte sequence.
+    return encoded[:budget].decode("utf-8", "ignore")
+
+
+def _scrub_filename_component(text: str) -> str:
+    """Replace filesystem-unsafe characters and trim trailing dots/spaces.
+
+    Windows silently strips trailing dots and spaces when creating a file, so
+    they must be removed here to keep the on-disk name matching the Markdown
+    link (and to keep the exists() dedupe from aliasing distinct names).
+    """
+
+    return _FILENAME_UNSAFE_PATTERN.sub("_", text).strip().rstrip(" .")
+
+
+def _truncate_filename(name: str) -> str:
+    """Bound a filename's UTF-8 byte length, preserving a short extension."""
+
+    if len(name.encode("utf-8")) <= _MAX_FILENAME_BYTES:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    ext_bytes = len(ext.encode("utf-8"))
+    if dot and 0 < ext_bytes <= 16:
+        return _truncate_to_bytes(stem, _MAX_FILENAME_BYTES - ext_bytes - 1) + "." + ext
+    return _truncate_to_bytes(name, _MAX_FILENAME_BYTES)
+
+
+class _AssetNamer:
+    """Allocates conversation-unique on-disk filenames for assets.
+
+    Assets that share a URL reuse one filename, so the download dedupe writes the
+    file once and every Markdown link resolves to it. Assets with distinct URLs
+    that would otherwise collide on the same basename (e.g. two attachments both
+    named "report.csv", or names differing only by a stripped directory prefix)
+    get a numeric suffix, so no link ever silently resolves to another asset's
+    bytes.
+    """
+
+    def __init__(self) -> None:
+        self._by_url: Dict[str, str] = {}
+        self._used: Set[str] = set()
+
+    def assign(self, url: str, desired: str) -> str:
+        existing = self._by_url.get(url)
+        if existing is not None:
+            return existing
+        name = desired
+        if name in self._used:
+            stem, dot, ext = desired.rpartition(".")
+            base = stem if dot else desired
+            suffix = dot + ext if dot else ""
+            counter = 1
+            name = f"{base}-{counter}{suffix}"
+            while name in self._used:
+                counter += 1
+                name = f"{base}-{counter}{suffix}"
+        self._used.add(name)
+        self._by_url[url] = name
+        return name
+
+
 def build_asset_filename(message_id: Optional[str], index: int, mime_type: Optional[str]) -> str:
-    base = (message_id or "asset").split("-")[0]
+    base = _scrub_filename_component((message_id or "asset").split("-")[0]) or "asset"
     extension = ""
     if mime_type and "/" in mime_type:
-        extension = mime_type.split("/")[-1]
-    extension = extension or "bin"
+        # Drop any MIME parameters (e.g. "image/svg+xml; charset=utf-8").
+        extension = mime_type.split(";")[0].split("/")[-1]
+    extension = _scrub_filename_component(extension) or "bin"
     return f"{base}-{index}.{extension}"
+
+
+def sanitize_asset_filename(
+    name: Optional[str],
+    message_id: Optional[str],
+    index: int,
+    mime_type: Optional[str],
+) -> str:
+    """Reduce an attachment name from the share page to a safe basename.
+
+    Names come from untrusted JSON, so path separators, traversal sequences,
+    drive prefixes, control characters, trailing dots/spaces, over-long names,
+    and Windows device names must not survive into the on-disk filename.
+    """
+
+    if name:
+        # PureWindowsPath treats both / and \ as separators and drops any
+        # drive/UNC prefix, so "../../x", "C:x", and "\\host\x" all reduce to the
+        # final component regardless of the platform this code runs on.
+        candidate = _truncate_filename(_scrub_filename_component(PureWindowsPath(name).name))
+        if candidate:
+            # Prefix reserved device names (CON, NUL, ...) rather than discard the
+            # name: "_aux.pdf" keeps the user's filename while staying writable.
+            if candidate.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+                candidate = "_" + candidate
+            return candidate
+    return build_asset_filename(message_id, index, mime_type)
 
 
 def slugify_title(title: str, share_id: str) -> str:
@@ -820,10 +1077,11 @@ def slugify_title(title: str, share_id: str) -> str:
 class ChatPeek:
     """High-level facade for downloading and exporting shared conversations."""
 
-    def __init__(self, link: str) -> None:
+    def __init__(self, link: str, options: Optional[ExportOptions] = None) -> None:
         self._link: str = link
+        self._options = options or ExportOptions()
         html = fetch_share_page(link)
-        self._chat = parse_share_html(html)
+        self._chat = parse_share_html(html, self._options)
 
     @property
     def chat(self) -> Chat:
@@ -844,6 +1102,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         action="store_true",
         help="Do not download linked assets (images, attachments)",
     )
+    parser.add_argument(
+        "--include-reasoning",
+        action="store_true",
+        help="Include reasoning traces such as thoughts and reasoning recaps",
+    )
+    parser.add_argument(
+        "--include-tool-output",
+        action="store_true",
+        help="Include tool outputs and tool payload summaries",
+    )
+    parser.add_argument(
+        "--include-model-context",
+        action="store_true",
+        help="Include model editable context blocks",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
@@ -851,7 +1124,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    chat = parse_share_html(html)
+    export_options = ExportOptions(
+        include_reasoning=args.include_reasoning,
+        include_tool_output=args.include_tool_output,
+        include_model_context=args.include_model_context,
+    )
+    chat = parse_share_html(html, export_options)
     markdown_path = chat.save_markdown(args.output, download_assets=not args.skip_assets)
     print(markdown_path)
 

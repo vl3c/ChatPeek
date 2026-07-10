@@ -18,6 +18,15 @@ python ChatPeek.py https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a83138
 # -> ./hybrid-cognitive-systems-69b1c492.md
 ```
 
+By default, ChatPeek now omits internal reasoning traces, tool outputs, and model editable context from the export. If you want to include them, use:
+
+```bash
+python ChatPeek.py https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a831385 \
+  --include-reasoning \
+  --include-tool-output \
+  --include-model-context
+```
+
 From Python you can orchestrate the export yourself:
 
 ```python
