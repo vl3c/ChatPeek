@@ -120,6 +120,15 @@ class ReplyType(Enum):
     TOOL = "tool"
 
 
+@dataclass(frozen=True)
+class ExportOptions:
+    """Controls which internal conversation details are included in exports."""
+
+    include_reasoning: bool = False
+    include_tool_output: bool = False
+    include_model_context: bool = False
+
+
 @dataclass
 class ConversationAsset:
     """Represents an external asset referenced by a message."""
@@ -382,7 +391,8 @@ def decode_loader(loader: List[JsonValue]) -> Dict[str, JsonValue]:
     return resolved
 
 
-def parse_modern_share(html: str) -> Chat:
+def parse_modern_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     loader = extract_loader_payload(html)
     if loader is None:
         raise ValueError("Modern share payload not found")
@@ -436,8 +446,10 @@ def parse_modern_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message, namer)
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
         author = author_name_for_role(role)
@@ -456,7 +468,100 @@ def parse_modern_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_legacy_share(html: str) -> Chat:
+def parse_post_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
+    loader = extract_loader_payload(html)
+    if loader is None:
+        raise ValueError("Post share payload not found")
+
+    decoded = decode_loader(loader)
+    loader_data = decoded.get("loaderData")
+    if not isinstance(loader_data, Mapping):
+        raise ValueError("Post share route not found")
+    route = loader_data.get("routes/s.$postId")
+    if not isinstance(route, Mapping):
+        raise ValueError("Post share route not found")
+    post_with_profile_raw = route.get("postWithProfile")
+    post_with_profile: Mapping[str, Any] = (
+        post_with_profile_raw if isinstance(post_with_profile_raw, Mapping) else {}
+    )
+    post_raw = post_with_profile.get("post")
+    post: Mapping[str, Any] = post_raw if isinstance(post_raw, Mapping) else {}
+    share_id_value = post.get("id")
+    share_id = share_id_value if isinstance(share_id_value, str) else "shared"
+    title_value = post.get("text")
+    title = title_value if isinstance(title_value, str) else ""
+    posted_at = post.get("posted_at")
+    updated_at = float(posted_at) if isinstance(posted_at, (int, float)) else None
+
+    messages: List[Mapping[str, Any]] = []
+    attachments = post.get("attachments", [])
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            if attachment.get("kind") != "message_slice":
+                continue
+            raw_messages = attachment.get("messages", [])
+            if isinstance(raw_messages, list):
+                messages.extend(
+                    message for message in raw_messages if isinstance(message, Mapping)
+                )
+
+    namer = _AssetNamer()
+    replies: List[Reply] = []
+
+    def append_message(message: Mapping[str, Any]) -> None:
+        author_info = message.get("author") or {}
+        role = author_info.get("role") if isinstance(author_info, Mapping) else None
+        if role == "system":
+            return
+        content = message.get("content") or {}
+        if not isinstance(content, Mapping):
+            return
+        message_id = cast(Optional[str], message.get("id"))
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
+        if not statement and not assets:
+            return
+        if role == "tool" and is_redacted_tool_output(statement):
+            return
+        reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
+        created_raw = message.get("create_time")
+        created_at = float(created_raw) if isinstance(created_raw, (int, float)) else None
+        replies.append(
+            Reply(
+                author_name=author_name_for_role(role),
+                type=reply_type,
+                statement=statement,
+                created_at=created_at,
+                assets=assets,
+            )
+        )
+
+    for message in messages:
+        append_message(message)
+        metadata = message.get("metadata") or {}
+        metadata_map = metadata if isinstance(metadata, Mapping) else {}
+        chatgpt_sdk = metadata_map.get("chatgpt_sdk") or {}
+        chatgpt_sdk_map = chatgpt_sdk if isinstance(chatgpt_sdk, Mapping) else {}
+        widget_state_raw = chatgpt_sdk_map.get("widget_state")
+        if not isinstance(widget_state_raw, str):
+            continue
+        try:
+            widget_state = json.loads(widget_state_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(widget_state, Mapping):
+            continue
+        report_message = widget_state.get("report_message")
+        if isinstance(report_message, Mapping):
+            append_message(report_message)
+
+    return Chat(share_id=share_id, ai_model="", title=title, updated_at=updated_at, replies=replies)
+
+
+def parse_legacy_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
     script_content: Optional[str] = None
     for attrs, text in _extract_scripts(html):
         if attrs.get("id") == "__NEXT_DATA__":
@@ -501,8 +606,10 @@ def parse_legacy_share(html: str) -> Chat:
         if not isinstance(content, Mapping):
             continue
         message_id = cast(Optional[str], message.get("id"))
-        statement, assets = flatten_message_content(message_id, content, message, namer)
+        statement, assets = flatten_message_content(message_id, content, message, export_options, namer)
         if not statement and not assets:
+            continue
+        if role == "tool" and is_redacted_tool_output(statement):
             continue
         author = author_name if role == "user" else author_name_for_role(role)
         reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
@@ -521,11 +628,21 @@ def parse_legacy_share(html: str) -> Chat:
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
-def parse_share_html(html: str) -> Chat:
+def parse_share_html(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    loader = extract_loader_payload(html)
+    if loader is not None:
+        decoded = decode_loader(loader)
+        loader_data = decoded.get("loaderData")
+        if isinstance(loader_data, Mapping) and "routes/s.$postId" in loader_data:
+            return parse_post_share(html, options)
+
     try:
-        return parse_modern_share(html)
+        return parse_modern_share(html, options)
     except (ValueError, KeyError):
-        return parse_legacy_share(html)
+        try:
+            return parse_post_share(html, options)
+        except (ValueError, KeyError):
+            return parse_legacy_share(html, options)
 
 
 def author_name_for_role(role: Optional[str]) -> str:
@@ -579,6 +696,37 @@ def summarize_tool_payload(data: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def message_recipient(message: Mapping[str, Any]) -> Optional[str]:
+    recipient = message.get("recipient")
+    if isinstance(recipient, str) and recipient:
+        return recipient
+    return None
+
+
+def is_tool_addressed(message: Mapping[str, Any]) -> bool:
+    """True when the message is addressed to a tool rather than the user.
+
+    ChatGPT marks user-visible messages with recipient "all"; tool invocations
+    carry the tool name (e.g. "web", "web.run", "python") instead.
+    """
+    recipient = message_recipient(message)
+    return recipient is not None and recipient != "all"
+
+
+def should_include_content(content_type: Optional[str], options: ExportOptions) -> bool:
+    if content_type in {"thoughts", "reasoning_recap"}:
+        return options.include_reasoning
+    if content_type == "tool_response":
+        return options.include_tool_output
+    if content_type == "model_editable_context":
+        return options.include_model_context
+    return True
+
+
+def is_redacted_tool_output(text: str) -> bool:
+    return text.strip().lower() == "the output of this plugin was redacted."
+
+
 def strip_private_use(text: str) -> str:
     return PRIVATE_USE_PATTERN.sub("", text)
 
@@ -597,9 +745,15 @@ def flatten_message_content(
     message_id: Optional[str],
     content: Mapping[str, Any],
     message: Mapping[str, Any],
+    options: Optional[ExportOptions] = None,
     namer: Optional["_AssetNamer"] = None,
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
+    export_options = options or ExportOptions()
+    if not should_include_content(content_type, export_options):
+        return "", []
+    if is_tool_addressed(message) and not export_options.include_tool_output:
+        return "", []
     assets: List[ConversationAsset] = []
 
     def render_asset_reference(asset: ConversationAsset) -> str:
@@ -691,7 +845,7 @@ def flatten_message_content(
         lang = language if isinstance(language, str) and language != "unknown" else ""
         text_body = code_text if isinstance(code_text, str) else ""
         body = text_body.rstrip("\n")
-        if body:
+        if body and message_recipient(message) != "all":
             try:
                 maybe_json = json.loads(body)
             except json.JSONDecodeError:
@@ -923,10 +1077,11 @@ def slugify_title(title: str, share_id: str) -> str:
 class ChatPeek:
     """High-level facade for downloading and exporting shared conversations."""
 
-    def __init__(self, link: str) -> None:
+    def __init__(self, link: str, options: Optional[ExportOptions] = None) -> None:
         self._link: str = link
+        self._options = options or ExportOptions()
         html = fetch_share_page(link)
-        self._chat = parse_share_html(html)
+        self._chat = parse_share_html(html, self._options)
 
     @property
     def chat(self) -> Chat:
@@ -947,6 +1102,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         action="store_true",
         help="Do not download linked assets (images, attachments)",
     )
+    parser.add_argument(
+        "--include-reasoning",
+        action="store_true",
+        help="Include reasoning traces such as thoughts and reasoning recaps",
+    )
+    parser.add_argument(
+        "--include-tool-output",
+        action="store_true",
+        help="Include tool outputs and tool payload summaries",
+    )
+    parser.add_argument(
+        "--include-model-context",
+        action="store_true",
+        help="Include model editable context blocks",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
@@ -954,7 +1124,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    chat = parse_share_html(html)
+    export_options = ExportOptions(
+        include_reasoning=args.include_reasoning,
+        include_tool_output=args.include_tool_output,
+        include_model_context=args.include_model_context,
+    )
+    chat = parse_share_html(html, export_options)
     markdown_path = chat.save_markdown(args.output, download_assets=not args.skip_assets)
     print(markdown_path)
 
