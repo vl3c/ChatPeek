@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
 from urllib.parse import urlparse
 
@@ -37,6 +37,43 @@ DEFAULT_HEADERS: Dict[str, str] = {
 
 
 EXPORT_ROOT: Path = Path("Exports")
+
+# Hosts ChatGPT/OpenAI serve conversation assets from. Asset URLs come from the
+# untrusted share page, so downloads are limited to these hosts (or their
+# subdomains); anything else is rendered as a placeholder instead of being
+# fetched. This is the initial-URL half of the SSRF defense; default_http_get
+# also refuses to follow redirects so an allowed host cannot bounce the fetch
+# to an internal address.
+ALLOWED_ASSET_HOST_SUFFIXES: Tuple[str, ...] = (
+    "oaiusercontent.com",
+    "oaistatic.com",
+    "chatgpt.com",
+    "openai.com",
+    # DALL-E images are served from this OpenAI-owned Azure storage account.
+    "oaidalleapiprodscus.blob.core.windows.net",
+)
+
+_ALLOWED_ASSET_HOST_DOTTED: Tuple[str, ...] = tuple(
+    "." + suffix for suffix in ALLOWED_ASSET_HOST_SUFFIXES
+)
+
+
+def is_allowed_asset_url(url: object) -> bool:
+    """Return True if url is an https link to a known ChatGPT/OpenAI asset host."""
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    # https only: real asset URLs are always https, and requiring it blocks
+    # cleartext fetches an attacker could otherwise steer through an allowed host.
+    if parsed.scheme != "https":
+        return False
+    # rstrip('.') normalizes a fully-qualified "host." form to its bare host.
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in ALLOWED_ASSET_HOST_SUFFIXES or host.endswith(_ALLOWED_ASSET_HOST_DOTTED)
 
 
 class _ScriptCollector(HTMLParser):
@@ -166,18 +203,29 @@ class Chat:
         if download_assets and needs_folder:
             images_dir = base_dir / "images"
             files_dir = base_dir / "attachments"
+            resolved_parents = {True: images_dir.resolve(), False: files_dir.resolve()}
+            fetch = http_get or default_http_get
             for reply in self.replies:
                 for asset in reply.assets:
-                    target_dir = images_dir if asset.asset_type == "image" else files_dir
-                    target_dir.mkdir(exist_ok=True)
+                    if not asset.downloadable or not is_allowed_asset_url(asset.url):
+                        continue
+                    is_image = asset.asset_type == "image"
+                    target_dir = images_dir if is_image else files_dir
                     target_path = target_dir / asset.filename
+                    # Asset filenames originate from untrusted share-page JSON;
+                    # never write outside the export folder even if a raw
+                    # filename slipped through sanitization.
+                    if target_path.resolve().parent != resolved_parents[is_image]:
+                        continue
+                    target_dir.mkdir(exist_ok=True)
                     if target_path.exists():
                         continue
-                    if not asset.downloadable or not asset.url or not asset.url.lower().startswith("http"):
-                        continue
-                    fetch = http_get or default_http_get
                     resp = fetch(asset.url)
                     resp.raise_for_status()
+                    # A redirect returns a non-2xx status (redirects are disabled);
+                    # skip it rather than write the redirect body as the asset.
+                    if getattr(resp, "status_code", 200) != 200:
+                        continue
                     target_path.write_bytes(resp.content)
 
         return markdown_path
@@ -188,7 +236,9 @@ class ShareAccessError(RuntimeError):
 
 
 def default_http_get(url: str) -> requests.Response:
-    return requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+    # allow_redirects is disabled so an allowed host cannot redirect the fetch to
+    # an internal address; is_allowed_asset_url only validates the initial URL.
+    return requests.get(url, headers=DEFAULT_HEADERS, timeout=30, allow_redirects=False)
 
 
 def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> str:
@@ -546,14 +596,14 @@ def flatten_message_content(
                 mime_str = mime if isinstance(mime, str) else None
                 name_value = attachment_raw.get("name")
                 name = name_value if isinstance(name_value, str) else None
-                filename = name or build_asset_filename(message_id, len(assets), mime_str)
+                filename = sanitize_asset_filename(name, message_id, len(assets), mime_str)
                 asset_type_raw = (
                     attachment_raw.get("file_type")
                     or attachment_raw.get("type")
                     or "file"
                 )
                 asset_type = asset_type_raw if isinstance(asset_type_raw, str) else "file"
-                downloadable = url.lower().startswith("http")
+                downloadable = is_allowed_asset_url(url)
                 description_raw = attachment_raw.get("title") or attachment_raw.get("name")
                 description = description_raw if isinstance(description_raw, str) else None
                 assets.append(
@@ -677,7 +727,7 @@ def flatten_message_content(
                     mime = mime_value if isinstance(mime_value, str) else None
                     filename = build_asset_filename(message_id, len(assets), mime)
                     asset_type = "image" if "image" in (p_type or "").lower() else "file"
-                    downloadable = pointer_raw.lower().startswith("http")
+                    downloadable = is_allowed_asset_url(pointer_raw)
                     assets.append(
                         ConversationAsset(
                             asset_type=asset_type,
@@ -704,13 +754,58 @@ def flatten_message_content(
     return finalize("")
 
 
+_FILENAME_UNSAFE_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+# Names that resolve to a device rather than a file on Windows.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _scrub_filename_component(text: str) -> str:
+    """Replace filesystem-unsafe characters and trim trailing dots/spaces.
+
+    Windows silently strips trailing dots and spaces when creating a file, so
+    they must be removed here to keep the on-disk name matching the Markdown
+    link (and to keep the exists() dedupe from aliasing distinct names).
+    """
+
+    return _FILENAME_UNSAFE_PATTERN.sub("_", text).strip().rstrip(" .")
+
+
 def build_asset_filename(message_id: Optional[str], index: int, mime_type: Optional[str]) -> str:
-    base = (message_id or "asset").split("-")[0]
+    base = _scrub_filename_component((message_id or "asset").split("-")[0]) or "asset"
     extension = ""
     if mime_type and "/" in mime_type:
-        extension = mime_type.split("/")[-1]
-    extension = extension or "bin"
+        # Drop any MIME parameters (e.g. "image/svg+xml; charset=utf-8").
+        extension = mime_type.split(";")[0].split("/")[-1]
+    extension = _scrub_filename_component(extension) or "bin"
     return f"{base}-{index}.{extension}"
+
+
+def sanitize_asset_filename(
+    name: Optional[str],
+    message_id: Optional[str],
+    index: int,
+    mime_type: Optional[str],
+) -> str:
+    """Reduce an attachment name from the share page to a safe basename.
+
+    Names come from untrusted JSON, so path separators, traversal sequences,
+    drive prefixes, control characters, trailing dots/spaces, and Windows
+    device names must not survive into the on-disk filename.
+    """
+
+    if name:
+        # PureWindowsPath treats both / and \ as separators and drops any
+        # drive/UNC prefix, so "../../x", "C:x", and "\\host\x" all reduce to the
+        # final component regardless of the platform this code runs on.
+        candidate = _scrub_filename_component(PureWindowsPath(name).name)
+        if candidate and candidate.split(".")[0].upper() not in _WINDOWS_RESERVED_NAMES:
+            return candidate
+    return build_asset_filename(message_id, index, mime_type)
 
 
 def slugify_title(title: str, share_id: str) -> str:

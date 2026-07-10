@@ -23,10 +23,12 @@ from ChatPeek import (
     extract_loader_payload,
     fetch_share_page,
     flatten_message_content,
+    is_allowed_asset_url,
     main,
     parse_legacy_share,
     parse_modern_share,
     parse_share_html,
+    sanitize_asset_filename,
     slugify_title,
     strip_private_use,
     strip_citation_tokens,
@@ -92,7 +94,7 @@ class ChatPeekModuleTests(unittest.TestCase):
             "metadata": {
                 "attachments": [
                     {
-                        "download_url": "https://example.com/file.txt",
+                        "download_url": "https://files.oaiusercontent.com/file.txt",
                         "name": "file.txt",
                         "mime_type": "text/plain",
                     }
@@ -127,7 +129,7 @@ class ChatPeekModuleTests(unittest.TestCase):
                 "parts": [
                     {
                         "content_type": "file",
-                        "asset_pointer": "https://example.com/asset.bin",
+                        "asset_pointer": "https://files.oaiusercontent.com/asset.bin",
                         "mime_type": "application/pdf",
                     }
                 ],
@@ -626,6 +628,11 @@ class BuildAssetFilenameTests(unittest.TestCase):
 
     def test_message_id_without_dash(self) -> None:
         self.assertEqual(build_asset_filename("abcdef", 0, "image/jpeg"), "abcdef-0.jpeg")
+
+    def test_mime_parameters_stripped_from_extension(self) -> None:
+        self.assertEqual(
+            build_asset_filename("msg", 0, "image/svg+xml; charset=utf-8"), "msg-0.svg+xml"
+        )
 
 
 class SlugifyTitleTests(unittest.TestCase):
@@ -1178,7 +1185,7 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
             assets=[
                 ConversationAsset(
                     asset_type="file",
-                    url="https://example.com/report.csv",
+                    url="https://files.oaiusercontent.com/report.csv",
                     filename="report.csv",
                     downloadable=True,
                 )
@@ -1186,6 +1193,7 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
         )
         chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
         mock_response = mock.Mock(spec=requests.Response)
+        mock_response.status_code = 200
         mock_response.content = b"col1,col2\na,b\n"
         mock_response.raise_for_status.return_value = None
         with tempfile.TemporaryDirectory() as tmp:
@@ -1235,6 +1243,215 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
             self.assertEqual(len(md_files), 1)
             content = md_files[0].read_text(encoding="utf-8")
             self.assertIn("Gigawatt", content)
+
+
+class IsAllowedAssetUrlTests(unittest.TestCase):
+    def test_allows_oaiusercontent_subdomain(self) -> None:
+        self.assertTrue(is_allowed_asset_url("https://files.oaiusercontent.com/a/b.png"))
+
+    def test_allows_chatgpt_host(self) -> None:
+        self.assertTrue(is_allowed_asset_url("https://chatgpt.com/backend-api/file"))
+
+    def test_allows_dalle_blob_host(self) -> None:
+        self.assertTrue(
+            is_allowed_asset_url("https://oaidalleapiprodscus.blob.core.windows.net/x/img.png")
+        )
+
+    def test_allows_fully_qualified_trailing_dot_host(self) -> None:
+        self.assertTrue(is_allowed_asset_url("https://files.oaiusercontent.com./x"))
+
+    def test_rejects_unrelated_host(self) -> None:
+        self.assertFalse(is_allowed_asset_url("https://example.com/file.txt"))
+
+    def test_rejects_http_scheme(self) -> None:
+        # https only — an allowed host over cleartext http must be refused.
+        self.assertFalse(is_allowed_asset_url("http://files.oaiusercontent.com/x"))
+        self.assertFalse(is_allowed_asset_url("http://chatgpt.com/x"))
+
+    def test_rejects_non_string(self) -> None:
+        self.assertFalse(is_allowed_asset_url(None))
+        self.assertFalse(is_allowed_asset_url(123))
+
+    def test_rejects_lookalike_hosts(self) -> None:
+        self.assertFalse(is_allowed_asset_url("https://evil-oaiusercontent.com/x"))
+        self.assertFalse(is_allowed_asset_url("https://oaiusercontent.com.evil.com/x"))
+
+    def test_rejects_internal_addresses(self) -> None:
+        self.assertFalse(is_allowed_asset_url("http://127.0.0.1:8080/admin"))
+        self.assertFalse(is_allowed_asset_url("http://169.254.169.254/latest/meta-data/"))
+
+    def test_rejects_non_http_schemes(self) -> None:
+        self.assertFalse(is_allowed_asset_url("file:///etc/passwd"))
+        self.assertFalse(is_allowed_asset_url("ftp://openai.com/x"))
+        self.assertFalse(is_allowed_asset_url("sediment://file_123"))
+
+    def test_rejects_empty_url(self) -> None:
+        self.assertFalse(is_allowed_asset_url(""))
+
+
+class SanitizeAssetFilenameTests(unittest.TestCase):
+    def test_plain_name_kept(self) -> None:
+        self.assertEqual(sanitize_asset_filename("report.csv", "msg-1", 0, None), "report.csv")
+
+    def test_traversal_reduced_to_basename(self) -> None:
+        self.assertEqual(sanitize_asset_filename("../../evil.txt", "msg-1", 0, None), "evil.txt")
+
+    def test_windows_separators_reduced_to_basename(self) -> None:
+        self.assertEqual(sanitize_asset_filename("..\\..\\evil.txt", "msg-1", 0, None), "evil.txt")
+
+    def test_absolute_path_reduced_to_basename(self) -> None:
+        self.assertEqual(sanitize_asset_filename("/etc/passwd", "msg-1", 0, None), "passwd")
+
+    def test_dot_dot_only_falls_back(self) -> None:
+        result = sanitize_asset_filename("../..", "msg-1", 0, "text/plain")
+        self.assertEqual(result, build_asset_filename("msg-1", 0, "text/plain"))
+
+    def test_none_falls_back(self) -> None:
+        result = sanitize_asset_filename(None, "msg-1", 0, "image/png")
+        self.assertEqual(result, "msg-0.png")
+
+    def test_control_and_reserved_chars_replaced(self) -> None:
+        result = sanitize_asset_filename('a*b?c"d.txt', "msg-1", 0, None)
+        self.assertEqual(result, "a_b_c_d.txt")
+
+    def test_drive_relative_path_reduced_to_basename(self) -> None:
+        # "C:evil.txt" is a drive-relative path on Windows; only "evil.txt" is safe.
+        self.assertEqual(sanitize_asset_filename("C:evil.txt", "msg-1", 0, None), "evil.txt")
+
+    def test_unc_path_reduced_to_basename(self) -> None:
+        self.assertEqual(
+            sanitize_asset_filename(r"\\host\share\evil.txt", "msg-1", 0, None), "evil.txt"
+        )
+
+    def test_trailing_dots_and_spaces_trimmed(self) -> None:
+        # Windows strips trailing dots/spaces at file creation, so they must not
+        # survive here or the on-disk name diverges from the Markdown link.
+        self.assertEqual(sanitize_asset_filename("report.csv. .", "msg-1", 0, None), "report.csv")
+
+    def test_leading_dot_preserved(self) -> None:
+        self.assertEqual(sanitize_asset_filename(".env", "msg-1", 0, None), ".env")
+
+    def test_windows_reserved_name_falls_back(self) -> None:
+        for reserved in ("NUL", "con", "NUL.txt", "COM1.log"):
+            result = sanitize_asset_filename(reserved, "msg-1", 3, "text/plain")
+            self.assertEqual(result, build_asset_filename("msg-1", 3, "text/plain"))
+
+
+class AssetSecurityTests(unittest.TestCase):
+    def test_traversal_attachment_name_is_sanitized_at_parse(self) -> None:
+        message: Dict[str, Any] = {
+            "id": "msg-evil",
+            "content": {"content_type": "text", "parts": ["See file"]},
+            "metadata": {
+                "attachments": [
+                    {
+                        "download_url": "https://files.oaiusercontent.com/file.txt",
+                        "name": "../../evil.txt",
+                        "mime_type": "text/plain",
+                    }
+                ]
+            },
+        }
+        _, assets = flatten_message_content("msg-evil", message["content"], message)
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(assets[0].filename, "evil.txt")
+
+    def test_off_domain_attachment_not_downloadable(self) -> None:
+        message: Dict[str, Any] = {
+            "id": "msg-ssrf",
+            "content": {"content_type": "text", "parts": ["See file"]},
+            "metadata": {
+                "attachments": [
+                    {
+                        "download_url": "http://169.254.169.254/latest/meta-data/",
+                        "name": "meta.txt",
+                    }
+                ]
+            },
+        }
+        text, assets = flatten_message_content("msg-ssrf", message["content"], message)
+        self.assertEqual(len(assets), 1)
+        self.assertFalse(assets[0].downloadable)
+        self.assertIn("not included in export", text)
+
+    def test_save_markdown_refuses_traversal_filename(self) -> None:
+        reply = Reply(
+            author_name="User",
+            type=ReplyType.HUMAN,
+            statement="Hello",
+            assets=[
+                ConversationAsset(
+                    asset_type="file",
+                    url="https://files.oaiusercontent.com/file.txt",
+                    filename="../../evil.txt",
+                    downloadable=True,
+                )
+            ],
+        )
+        chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+        http_get = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp), download_assets=True, http_get=http_get)
+            self.assertTrue(md_path.exists())
+            http_get.assert_not_called()
+            # The traversal target (two levels above attachments/) must not exist.
+            self.assertFalse((Path(tmp) / "evil.txt").exists())
+            self.assertFalse((md_path.parent / "evil.txt").exists())
+
+    def test_save_markdown_skips_off_domain_url(self) -> None:
+        reply = Reply(
+            author_name="User",
+            type=ReplyType.HUMAN,
+            statement="Hello",
+            assets=[
+                ConversationAsset(
+                    asset_type="file",
+                    url="https://example.com/report.csv",
+                    filename="report.csv",
+                    downloadable=True,
+                )
+            ],
+        )
+        chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+        http_get = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp), download_assets=True, http_get=http_get)
+            http_get.assert_not_called()
+            self.assertFalse((md_path.parent / "attachments" / "report.csv").exists())
+
+    def test_save_markdown_skips_redirect_response(self) -> None:
+        # An allowed host that responds with a redirect (redirects are disabled,
+        # so this surfaces as a non-2xx status) must not have its body written.
+        reply = Reply(
+            author_name="User",
+            type=ReplyType.HUMAN,
+            statement="Hello",
+            assets=[
+                ConversationAsset(
+                    asset_type="file",
+                    url="https://files.oaiusercontent.com/report.csv",
+                    filename="report.csv",
+                    downloadable=True,
+                )
+            ],
+        )
+        chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+        redirect = mock.Mock(spec=requests.Response)
+        redirect.status_code = 302
+        redirect.content = b"<html>redirecting to http://169.254.169.254/</html>"
+        redirect.raise_for_status.return_value = None
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(
+                Path(tmp), download_assets=True, http_get=lambda url: redirect
+            )
+            self.assertFalse((md_path.parent / "attachments" / "report.csv").exists())
+
+    @mock.patch("requests.get")
+    def test_default_http_get_disables_redirects(self, mock_get: mock.Mock) -> None:
+        from ChatPeek import default_http_get
+
+        default_http_get("https://files.oaiusercontent.com/x")
+        self.assertFalse(mock_get.call_args.kwargs["allow_redirects"])
 
 
 if __name__ == "__main__":
