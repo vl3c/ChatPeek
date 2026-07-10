@@ -14,8 +14,8 @@ ChatPeek downloads an individual `chatgpt.com/share/...` link (using the same he
 
 ```bash
 python -m pip install -r requirements.txt  # requests + beautifulsoup4
-python ChatPeek.py https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2
-# -> ./gigawatt-data-centers-690781ed.md
+python ChatPeek.py https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a831385
+# -> ./hybrid-cognitive-systems-69b1c492.md
 ```
 
 From Python you can orchestrate the export yourself:
@@ -24,7 +24,7 @@ From Python you can orchestrate the export yourself:
 from pathlib import Path
 from ChatPeek import ChatPeek
 
-peek = ChatPeek("https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2")
+peek = ChatPeek("https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a831385")
 markdown_path = peek.chat.save_markdown(Path("exports"), download_assets=True)
 print(markdown_path)
 ```
