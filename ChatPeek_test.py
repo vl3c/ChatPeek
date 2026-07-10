@@ -1345,8 +1345,16 @@ class SanitizeAssetFilenameTests(unittest.TestCase):
 
     def test_overlong_name_truncated(self) -> None:
         result = sanitize_asset_filename("a" * 5000 + ".txt", "msg-1", 0, None)
-        self.assertLessEqual(len(result), 200)
+        self.assertLessEqual(len(result.encode("utf-8")), 200)
         self.assertTrue(result.endswith(".txt"))
+
+    def test_overlong_multibyte_name_truncated_by_bytes(self) -> None:
+        # A CJK name can be <=200 chars yet >255 UTF-8 bytes; the cap is on bytes.
+        result = sanitize_asset_filename("あ" * 300 + ".txt", "msg-1", 0, None)
+        self.assertLessEqual(len(result.encode("utf-8")), 200)
+        self.assertTrue(result.endswith(".txt"))
+        # Truncation must not leave a broken partial character.
+        result.encode("utf-8").decode("utf-8")
 
 
 class AssetSecurityTests(unittest.TestCase):
@@ -1494,6 +1502,19 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIs(result, redirect)
         self.assertEqual(mock_get.call_count, 1)  # internal host never requested
 
+    @mock.patch("requests.get")
+    def test_default_http_get_bounds_redirect_chain(self, mock_get: mock.Mock) -> None:
+        # An endless chain of allowed-host redirects stops after the hop cap
+        # instead of looping forever.
+        redirect = mock.Mock(spec=requests.Response)
+        redirect.is_redirect = True
+        redirect.headers = {"Location": "https://files.oaiusercontent.com/next"}
+        mock_get.return_value = redirect
+        result = default_http_get("https://files.oaiusercontent.com/start")
+        self.assertIs(result, redirect)
+        # 1 initial GET + at most 5 followed hops.
+        self.assertLessEqual(mock_get.call_count, 6)
+
     def test_malformed_host_does_not_abort_export(self) -> None:
         # "https://.openai.com/x" passes the allowlist but requests raises
         # InvalidURL; the export must still complete instead of crashing.
@@ -1546,7 +1567,9 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertFalse((md_path.parent / "attachments" / "pic.png").exists())
 
     def test_save_markdown_refuses_absolute_and_drive_filenames(self) -> None:
-        http_get = mock.Mock()
+        # The containment guard must skip absolute/drive/UNC filenames BEFORE the
+        # fetch. A would-succeed 200 response is used so that if the guard were
+        # removed, the code would reach http_get — assert_not_called then fails.
         for bad in ("C:\\evil.txt", "\\\\host\\share\\evil.txt", "/etc/evil.txt"):
             reply = Reply(
                 author_name="User",
@@ -1562,12 +1585,15 @@ class AssetSecurityTests(unittest.TestCase):
                 ],
             )
             chat = Chat(share_id="abcdef12", ai_model="", title="Test", updated_at=None, replies=[reply])
+            resp = mock.Mock(spec=requests.Response)
+            resp.status_code = 200
+            resp.content = b"OWNED"
+            resp.raise_for_status.return_value = None
+            http_get = mock.Mock(return_value=resp)
             with tempfile.TemporaryDirectory() as tmp:
                 chat.save_markdown(Path(tmp), download_assets=True, http_get=http_get)
-                # Nothing written outside the two export subdirectories.
-                escaped = [p for p in Path(tmp).rglob("evil.txt")
-                           if p.parent.name not in ("images", "attachments")]
-                self.assertEqual(escaped, [])
+                # Guard fired before any fetch, so the escaping path was never written.
+                http_get.assert_not_called()
 
 
 class AssetNamerTests(unittest.TestCase):

@@ -804,8 +804,20 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 # Cap the on-disk name well under the ~255-byte NAME_MAX / MAX_PATH limits so an
-# over-long attacker-supplied name cannot make write_bytes raise OSError.
-_MAX_FILENAME_LEN = 200
+# over-long attacker-supplied name cannot make write_bytes raise OSError. The cap
+# is in bytes (not characters) because NAME_MAX is a byte limit, so a multibyte
+# name (e.g. CJK) is bounded by its UTF-8 length.
+_MAX_FILENAME_BYTES = 200
+
+
+def _truncate_to_bytes(text: str, budget: int) -> str:
+    if budget <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    # errors="ignore" drops a trailing partial multibyte sequence.
+    return encoded[:budget].decode("utf-8", "ignore")
 
 
 def _scrub_filename_component(text: str) -> str:
@@ -820,14 +832,15 @@ def _scrub_filename_component(text: str) -> str:
 
 
 def _truncate_filename(name: str) -> str:
-    """Bound a filename's length, preserving a short extension when present."""
+    """Bound a filename's UTF-8 byte length, preserving a short extension."""
 
-    if len(name) <= _MAX_FILENAME_LEN:
+    if len(name.encode("utf-8")) <= _MAX_FILENAME_BYTES:
         return name
     stem, dot, ext = name.rpartition(".")
-    if dot and 0 < len(ext) <= 16:
-        return stem[: _MAX_FILENAME_LEN - len(ext) - 1] + "." + ext
-    return name[:_MAX_FILENAME_LEN]
+    ext_bytes = len(ext.encode("utf-8"))
+    if dot and 0 < ext_bytes <= 16:
+        return _truncate_to_bytes(stem, _MAX_FILENAME_BYTES - ext_bytes - 1) + "." + ext
+    return _truncate_to_bytes(name, _MAX_FILENAME_BYTES)
 
 
 class _AssetNamer:
