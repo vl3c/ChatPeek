@@ -31,11 +31,27 @@ print(markdown_path)
 
 ## Testing
 
-All behaviour is covered by unit tests. They replay a single saved HTML fixture (no live traffic). Run them with:
+All behaviour is covered by unit tests. They replay saved HTML fixtures under `fixtures/` (no live traffic), so they keep passing even after a share link expires. Run them with:
 
 ```bash
 python -m unittest ChatPeek_test.py
 ```
+
+### Keeping the fixture links fresh
+
+The fixtures were captured from real share links, and those links can go dead over time. A separate check confirms the backing links are still live and still expose the varied content the tests rely on:
+
+```bash
+python check_fixture_links.py        # exits non-zero and prints guidance if any link is stale
+```
+
+If a link is stale, the output tells you how to mint a replacement — including a ready-to-paste prompt that makes an AI chat generate a suitably varied conversation — and how to re-capture the fixture:
+
+```bash
+python check_fixture_links.py --capture https://chatgpt.com/share/<new-id>
+```
+
+CI runs the offline tests on every push and pull request, and runs the liveness check on a weekly schedule so a stale link surfaces on its own (a failed scheduled run notifies the repository owner). You can also set `CHATPEEK_CHECK_LINKS=1` to fold the liveness check into the unit-test run locally.
 
 ## Responsible use
 

@@ -1,12 +1,16 @@
 import json
+import os
 import re
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, cast
 from unittest import mock
 
 import requests
+
+from check_fixture_links import FIXTURE_LINKS, check_fixture_link
 
 from ChatPeek import (
     Chat,
@@ -1415,6 +1419,26 @@ class VariedShareFixtureTests(unittest.TestCase):
             md_path = chat.save_markdown(Path(tmp), download_assets=False)
             self.assertTrue(md_path.exists())
             self.assertEqual(md_path.name, "hybrid-cognitive-systems-69b1c492.md")
+
+
+@unittest.skipUnless(
+    os.environ.get("CHATPEEK_CHECK_LINKS"),
+    "network liveness check; set CHATPEEK_CHECK_LINKS=1 to run",
+)
+class FixtureLinkLivenessTests(unittest.TestCase):
+    """Opt-in network check: warn and fail when a fixture's backing share link
+    has gone stale, so a maintainer is told to mint a replacement. Skipped by
+    default so the normal suite stays offline and deterministic."""
+
+    def test_backing_share_links_are_live(self) -> None:
+        problems: List[str] = []
+        for link in FIXTURE_LINKS:
+            message = check_fixture_link(link)
+            if message is not None:
+                warnings.warn(message, stacklevel=2)
+                problems.append(message)
+        if problems:
+            self.fail("\n\n".join(problems))
 
 
 if __name__ == "__main__":
