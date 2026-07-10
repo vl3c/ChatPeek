@@ -384,6 +384,97 @@ def parse_modern_share(html: str, options: Optional[ExportOptions] = None) -> Ch
     return Chat(share_id=share_id, ai_model=model_slug, title=title, updated_at=updated_at, replies=replies)
 
 
+def parse_post_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    export_options = options or ExportOptions()
+    loader = extract_loader_payload(html)
+    if loader is None:
+        raise ValueError("Post share payload not found")
+
+    decoded = decode_loader(loader)
+    loader_data = decoded.get("loaderData")
+    if not isinstance(loader_data, Mapping):
+        raise ValueError("Post share route not found")
+    route = loader_data.get("routes/s.$postId")
+    if not isinstance(route, Mapping):
+        raise ValueError("Post share route not found")
+    post_with_profile_raw = route.get("postWithProfile")
+    post_with_profile: Mapping[str, Any] = (
+        post_with_profile_raw if isinstance(post_with_profile_raw, Mapping) else {}
+    )
+    post_raw = post_with_profile.get("post")
+    post: Mapping[str, Any] = post_raw if isinstance(post_raw, Mapping) else {}
+    share_id_value = post.get("id")
+    share_id = share_id_value if isinstance(share_id_value, str) else "shared"
+    title_value = post.get("text")
+    title = title_value if isinstance(title_value, str) else ""
+    posted_at = post.get("posted_at")
+    updated_at = float(posted_at) if isinstance(posted_at, (int, float)) else None
+
+    messages: List[Mapping[str, Any]] = []
+    attachments = post.get("attachments", [])
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            if attachment.get("kind") != "message_slice":
+                continue
+            raw_messages = attachment.get("messages", [])
+            if isinstance(raw_messages, list):
+                messages.extend(
+                    message for message in raw_messages if isinstance(message, Mapping)
+                )
+
+    replies: List[Reply] = []
+
+    def append_message(message: Mapping[str, Any]) -> None:
+        author_info = message.get("author") or {}
+        role = author_info.get("role") if isinstance(author_info, Mapping) else None
+        if role == "system":
+            return
+        content = message.get("content") or {}
+        if not isinstance(content, Mapping):
+            return
+        message_id = cast(Optional[str], message.get("id"))
+        statement, assets = flatten_message_content(message_id, content, message, export_options)
+        if not statement and not assets:
+            return
+        if role == "tool" and is_redacted_tool_output(statement):
+            return
+        reply_type = ReplyType(role) if role in ReplyType._value2member_map_ else ReplyType.AI
+        created_raw = message.get("create_time")
+        created_at = float(created_raw) if isinstance(created_raw, (int, float)) else None
+        replies.append(
+            Reply(
+                author_name=author_name_for_role(role),
+                type=reply_type,
+                statement=statement,
+                created_at=created_at,
+                assets=assets,
+            )
+        )
+
+    for message in messages:
+        append_message(message)
+        metadata = message.get("metadata") or {}
+        metadata_map = metadata if isinstance(metadata, Mapping) else {}
+        chatgpt_sdk = metadata_map.get("chatgpt_sdk") or {}
+        chatgpt_sdk_map = chatgpt_sdk if isinstance(chatgpt_sdk, Mapping) else {}
+        widget_state_raw = chatgpt_sdk_map.get("widget_state")
+        if not isinstance(widget_state_raw, str):
+            continue
+        try:
+            widget_state = json.loads(widget_state_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(widget_state, Mapping):
+            continue
+        report_message = widget_state.get("report_message")
+        if isinstance(report_message, Mapping):
+            append_message(report_message)
+
+    return Chat(share_id=share_id, ai_model="", title=title, updated_at=updated_at, replies=replies)
+
+
 def parse_legacy_share(html: str, options: Optional[ExportOptions] = None) -> Chat:
     export_options = options or ExportOptions()
     script_content: Optional[str] = None
@@ -452,10 +543,20 @@ def parse_legacy_share(html: str, options: Optional[ExportOptions] = None) -> Ch
 
 
 def parse_share_html(html: str, options: Optional[ExportOptions] = None) -> Chat:
+    loader = extract_loader_payload(html)
+    if loader is not None:
+        decoded = decode_loader(loader)
+        loader_data = decoded.get("loaderData")
+        if isinstance(loader_data, Mapping) and "routes/s.$postId" in loader_data:
+            return parse_post_share(html, options)
+
     try:
         return parse_modern_share(html, options)
     except (ValueError, KeyError):
-        return parse_legacy_share(html, options)
+        try:
+            return parse_post_share(html, options)
+        except (ValueError, KeyError):
+            return parse_legacy_share(html, options)
 
 
 def author_name_for_role(role: Optional[str]) -> str:
@@ -509,26 +610,21 @@ def summarize_tool_payload(data: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def is_tool_invocation_payload(data: Mapping[str, Any]) -> bool:
-    tool_keys = {
-        "click",
-        "edit",
-        "file",
-        "finance",
-        "image_query",
-        "input",
-        "move",
-        "open",
-        "press_key",
-        "response_length",
-        "search_query",
-        "time",
-        "weather",
-        "sports",
-    }
-    if any(key in data for key in tool_keys):
-        return True
-    return False
+def message_recipient(message: Mapping[str, Any]) -> Optional[str]:
+    recipient = message.get("recipient")
+    if isinstance(recipient, str) and recipient:
+        return recipient
+    return None
+
+
+def is_tool_addressed(message: Mapping[str, Any]) -> bool:
+    """True when the message is addressed to a tool rather than the user.
+
+    ChatGPT marks user-visible messages with recipient "all"; tool invocations
+    carry the tool name (e.g. "web", "web.run", "python") instead.
+    """
+    recipient = message_recipient(message)
+    return recipient is not None and recipient != "all"
 
 
 def should_include_content(content_type: Optional[str], options: ExportOptions) -> bool:
@@ -542,7 +638,7 @@ def should_include_content(content_type: Optional[str], options: ExportOptions) 
 
 
 def is_redacted_tool_output(text: str) -> bool:
-    return text.strip() == "The output of this plugin was redacted."
+    return text.strip().lower() == "the output of this plugin was redacted."
 
 
 def strip_private_use(text: str) -> str:
@@ -567,6 +663,10 @@ def flatten_message_content(
 ) -> Tuple[str, List[ConversationAsset]]:
     content_type = content.get("content_type")
     export_options = options or ExportOptions()
+    if not should_include_content(content_type, export_options):
+        return "", []
+    if is_tool_addressed(message) and not export_options.include_tool_output:
+        return "", []
     assets: List[ConversationAsset] = []
 
     def render_asset_reference(asset: ConversationAsset) -> str:
@@ -656,18 +756,14 @@ def flatten_message_content(
         lang = language if isinstance(language, str) and language != "unknown" else ""
         text_body = code_text if isinstance(code_text, str) else ""
         body = text_body.rstrip("\n")
-        if body:
+        if body and message_recipient(message) != "all":
             try:
                 maybe_json = json.loads(body)
             except json.JSONDecodeError:
                 maybe_json = None
             if isinstance(maybe_json, Mapping):
-                if is_tool_invocation_payload(maybe_json):
-                    return finalize("")
                 summary = summarize_tool_payload(maybe_json)
                 if summary is not None:
-                    if not export_options.include_tool_output:
-                        return finalize("")
                     return finalize(summary)
                 cleaned_dict = {
                     key: value
@@ -680,8 +776,6 @@ def flatten_message_content(
         return finalize(f"```{lang}\n{body}\n```")
 
     if content_type == "thoughts":
-        if not export_options.include_reasoning:
-            return finalize("")
         thoughts: List[str] = []
         thoughts_field = content.get("thoughts", [])
         if isinstance(thoughts_field, list):
@@ -698,15 +792,11 @@ def flatten_message_content(
         return finalize("\n\n".join(thoughts))
 
     if content_type == "reasoning_recap":
-        if not export_options.include_reasoning:
-            return finalize("")
         recap_raw = content.get("content", "")
         recap = recap_raw if isinstance(recap_raw, str) else ""
         return finalize(f"_{recap.strip()}_" if recap else "")
 
     if content_type == "model_editable_context":
-        if not export_options.include_model_context:
-            return finalize("")
         model_context = content.get("model_set_context", "")
         if isinstance(model_context, str):
             return finalize(model_context.strip())
@@ -753,8 +843,6 @@ def flatten_message_content(
         return finalize("\n\n".join(segment.strip() for segment in segments if segment.strip()))
 
     if content_type == "tool_response":
-        if not export_options.include_tool_output:
-            return finalize("")
         output_raw = content.get("output", "")
         output = output_raw if isinstance(output_raw, str) else ""
         return finalize(strip_private_use(output))
