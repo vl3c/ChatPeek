@@ -225,11 +225,21 @@ class Chat:
                         continue
                     is_image = asset.asset_type == "image"
                     target_dir = images_dir if is_image else files_dir
+                    # Asset filenames originate from untrusted share-page JSON, so
+                    # require a bare path component before building any path.
+                    # PureWindowsPath applies the stricter (Windows) rules on every
+                    # platform, which is what makes this check platform-independent:
+                    # on POSIX, "C:\evil.txt" and "\\host\share\evil.txt" are legal
+                    # single filenames, so the containment check below passes them
+                    # and the export ends up holding a file no Windows machine can
+                    # open and no Markdown link resolves to.
+                    if PureWindowsPath(asset.filename).name != asset.filename:
+                        continue
                     target_path = target_dir / asset.filename
                     try:
-                        # Asset filenames originate from untrusted share-page JSON;
-                        # never write outside the export folder even if a raw
-                        # filename slipped through sanitization.
+                        # Second layer: even a bare component must resolve to a
+                        # direct child of the target folder, so a symlink or a name
+                        # that slipped through above still cannot escape.
                         if target_path.resolve().parent != resolved_parents[is_image]:
                             continue
                         target_dir.mkdir(exist_ok=True)
