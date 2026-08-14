@@ -1,0 +1,67 @@
+name: Run ChatPeek export
+
+on:
+  push:
+    branches: [ 'run-peek' ]
+  workflow_dispatch:
+    inputs:
+      share_url:
+        description: 'ChatGPT share URL (https://chatgpt.com/share/...)'
+        required: true
+        default: 'https://chatgpt.com/share/6a7de646-63e0-83ed-8696-7351947b89ad'
+      skip_assets:
+        description: 'Skip downloading images/attachments (true/false)'
+        required: false
+        default: 'false'
+      include_tool_output:
+        description: 'Include tool outputs (true/false)'
+        required: false
+        default: 'false'
+      include_reasoning:
+        description: 'Include reasoning traces (true/false)'
+        required: false
+        default: 'false'
+      include_model_context:
+        description: 'Include model editable context (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+
+      - name: Run run_peek.py
+        env:
+          SHARE_URL: ${{ inputs.share_url }}
+        run: |
+          set -e
+          SKIP_ASSETS=${{ inputs.skip_assets }}
+          EXTRA_ARGS=""
+          if [ "${{ inputs.include_tool_output }}" = 'true' ]; then EXTRA_ARGS="$EXTRA_ARGS --include-tool-output"; fi
+          if [ "${{ inputs.include_reasoning }}" = 'true' ]; then EXTRA_ARGS="$EXTRA_ARGS --include-reasoning"; fi
+          if [ "${{ inputs.include_model_context }}" = 'true' ]; then EXTRA_ARGS="$EXTRA_ARGS --include-model-context"; fi
+          if [ "$SKIP_ASSETS" = 'true' ]; then EXTRA_ARGS="$EXTRA_ARGS --skip-assets"; fi
+          python run_peek.py --url "${SHARE_URL}" --output Exports --attempts 3 --timeout 120 $EXTRA_ARGS
+
+      - name: List exports
+        run: ls -R Exports || true
+
+      - name: Upload exports artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatpeek-exports
+          path: Exports
