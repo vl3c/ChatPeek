@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -255,6 +256,13 @@ class ShareAccessError(RuntimeError):
 
 _MAX_ASSET_REDIRECTS = 5
 
+# Retry policy for the share fetch. Only failures that a later attempt could
+# plausibly resolve are retried -- see fetch_share_page for why everything else
+# is treated as final.
+DEFAULT_FETCH_ATTEMPTS: int = 3
+_RETRY_BACKOFF_SECONDS: float = 5.0
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 
 def default_http_get(url: str) -> requests.Response:
     """Fetch an asset, following redirects only to other allowed asset hosts.
@@ -283,25 +291,65 @@ def default_http_get(url: str) -> requests.Response:
     return response
 
 
-def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> str:
-    """Fetch the shared conversation HTML once using private-window style headers."""
+def fetch_share_page(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Fetch the shared conversation HTML using private-window style headers.
+
+    Only *transient* failures are retried: connection errors, timeouts, and the
+    statuses in _RETRYABLE_STATUS_CODES. A deterministic answer -- a private
+    conversation, a deleted share, any other 4xx -- is raised on the first
+    attempt, because a retry would return the same result and only add load to a
+    server that already answered the question.
+
+    Args:
+        url: The https://chatgpt.com/share/... link to fetch.
+        headers: Extra headers merged over the browser-style defaults.
+        timeout: Per-attempt timeout in seconds.
+        attempts: Maximum attempts before giving up; 1 disables retrying.
+        sleep: Injector for the backoff delay (facilitates testing).
+
+    Returns:
+        The HTML body of the share page.
+
+    Raises:
+        ShareAccessError: The link points at a private conversation.
+        requests.RequestException: The final attempt failed.
+    """
 
     merged_headers = {**DEFAULT_HEADERS, "Referer": "https://chatgpt.com/"}
     if headers:
         merged_headers.update(headers)
-    response = requests.get(url, headers=merged_headers, timeout=timeout)
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        parsed = urlparse(url)
-        path = parsed.path or ""
-        if response.status_code == 403 and parsed.netloc.endswith("chatgpt.com") and path.startswith("/c/"):
-            raise ShareAccessError(
-                "The provided link appears to be a private conversation. "
-                "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
-            ) from exc
-        raise
-    return response.text
+
+    total = max(attempts, 1)
+    for attempt in range(1, total + 1):
+        try:
+            response = requests.get(url, headers=merged_headers, timeout=timeout)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            parsed = urlparse(url)
+            path = parsed.path or ""
+            if response.status_code == 403 and parsed.netloc.endswith("chatgpt.com") and path.startswith("/c/"):
+                raise ShareAccessError(
+                    "The provided link appears to be a private conversation. "
+                    "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
+                ) from exc
+            if attempt == total or response.status_code not in _RETRYABLE_STATUS_CODES:
+                raise
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == total:
+                raise
+        else:
+            return response.text
+        sleep(_RETRY_BACKOFF_SECONDS * attempt)
+
+    # Unreachable: the final attempt either returns or re-raises above. Kept so
+    # the function has a return path the type checker can prove.
+    raise ShareAccessError(f"Could not fetch {url} after {total} attempts.")
 
 
 def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
@@ -1098,6 +1146,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         help="Destination directory for the exported conversation",
     )
     parser.add_argument(
+        "--attempts",
+        type=int,
+        default=DEFAULT_FETCH_ATTEMPTS,
+        help=(
+            "Attempts for the share fetch; connection errors, timeouts and "
+            "429/5xx responses are retried with a linear backoff (1 disables retrying)"
+        ),
+    )
+    parser.add_argument(
         "--skip-assets",
         action="store_true",
         help="Do not download linked assets (images, attachments)",
@@ -1120,7 +1177,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
-        html = fetch_share_page(args.share_url)
+        html = fetch_share_page(args.share_url, attempts=args.attempts)
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
