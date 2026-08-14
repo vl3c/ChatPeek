@@ -18,6 +18,8 @@ python ChatPeek.py https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a83138
 # -> ./hybrid-cognitive-systems-69b1c492.md
 ```
 
+The share fetch makes up to three attempts (two retries) on transient failures - connection errors, timeouts, truncated responses, and HTTP 429/5xx - backing off 5s then 10s, or honouring a `Retry-After` header when the server sends one. A deterministic answer such as a deleted share or a private conversation fails immediately instead, since retrying it would return the same result. Pass `--attempts 1` to disable retrying, or a higher count on an unreliable connection.
+
 By default, ChatPeek now omits internal reasoning traces, tool outputs, and model editable context from the export. If you want to include them, use:
 
 ```bash

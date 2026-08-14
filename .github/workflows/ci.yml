@@ -12,6 +12,12 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# Least privilege for the default GITHUB_TOKEN: both jobs only read the repo.
+# Set at the top level so any job added later starts read-only and has to opt
+# into more, rather than silently inheriting the repository default.
+permissions:
+  contents: read
+
 jobs:
   test:
     # Offline unit tests: replay saved fixtures, no network.

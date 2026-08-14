@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -265,6 +266,55 @@ class ShareAccessError(RuntimeError):
 
 _MAX_ASSET_REDIRECTS = 5
 
+# Retry policy for the share fetch. Only failures that a later attempt could
+# plausibly resolve are retried -- see fetch_share_page for why everything else
+# is treated as final.
+DEFAULT_FETCH_ATTEMPTS: int = 3
+_RETRY_BACKOFF_SECONDS: float = 5.0
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+# Transport faults worth another attempt. ChunkedEncodingError and
+# ContentDecodingError surface from requests.get itself rather than from a
+# status code: the default stream=False reads the body during send(), so a
+# connection dropped mid-body or a truncated gzip is raised there.
+_RETRYABLE_EXCEPTIONS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+
+# Subclasses of ConnectionError whose cause is configuration rather than
+# congestion: a rejected certificate or an unreachable proxy answers the same
+# way every time, so retrying only delays an error the caller has to fix.
+_FINAL_CONNECTION_EXCEPTIONS = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ProxyError,
+)
+
+# A throttled response names its own delay. Honour it in preference to the
+# backoff -- a fixed 5s wait against a limiter asking for 60s just re-trips it --
+# but cap it so a hostile or absurd Retry-After cannot park the CLI.
+_MAX_RETRY_AFTER_SECONDS: float = 60.0
+
+
+def _retry_delay(response: Optional[requests.Response], attempt: int) -> float:
+    """Seconds to wait before the next attempt.
+
+    Prefers a usable Retry-After header, falling back to the linear backoff when
+    the header is absent, non-numeric (the RFC also permits an HTTP-date form),
+    or non-positive.
+    """
+
+    backoff = _RETRY_BACKOFF_SECONDS * attempt
+    if response is None:
+        return backoff
+    try:
+        requested = float(response.headers["Retry-After"])
+    except (KeyError, TypeError, ValueError):
+        return backoff
+    return min(requested, _MAX_RETRY_AFTER_SECONDS) if requested > 0 else backoff
+
 
 def default_http_get(url: str) -> requests.Response:
     """Fetch an asset, following redirects only to other allowed asset hosts.
@@ -293,25 +343,77 @@ def default_http_get(url: str) -> requests.Response:
     return response
 
 
-def fetch_share_page(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> str:
-    """Fetch the shared conversation HTML once using private-window style headers."""
+def fetch_share_page(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Fetch the shared conversation HTML using private-window style headers.
+
+    Only *transient* failures are retried: the transport faults in
+    _RETRYABLE_EXCEPTIONS and the statuses in _RETRYABLE_STATUS_CODES. A
+    deterministic answer -- a private conversation, a deleted share, any other
+    4xx, a rejected certificate -- is raised on the first attempt, because a
+    retry would return the same result and only add load to a server that
+    already answered the question.
+
+    Args:
+        url: The https://chatgpt.com/share/... link to fetch.
+        headers: Extra headers merged over the browser-style defaults.
+        timeout: Per-attempt timeout in seconds.
+        attempts: Maximum attempts before giving up; 1 disables retrying.
+        sleep: Injector for the backoff delay (facilitates testing).
+
+    Returns:
+        The HTML body of the share page.
+
+    Raises:
+        ShareAccessError: The link points at a private conversation.
+        requests.RequestException: The final attempt failed.
+    """
 
     merged_headers = {**DEFAULT_HEADERS, "Referer": "https://chatgpt.com/"}
     if headers:
         merged_headers.update(headers)
-    response = requests.get(url, headers=merged_headers, timeout=timeout)
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        parsed = urlparse(url)
-        path = parsed.path or ""
-        if response.status_code == 403 and parsed.netloc.endswith("chatgpt.com") and path.startswith("/c/"):
-            raise ShareAccessError(
-                "The provided link appears to be a private conversation. "
-                "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
-            ) from exc
-        raise
-    return response.text
+
+    total = max(attempts, 1)
+    for attempt in range(1, total + 1):
+        response: Optional[requests.Response] = None
+        try:
+            response = requests.get(url, headers=merged_headers, timeout=timeout)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # Read the status off the exception rather than the loop-local
+            # response: the two disagree if requests.get itself ever raises, and
+            # a stale status from a previous attempt would misroute this one.
+            failed = exc.response
+            status = failed.status_code if failed is not None else None
+            parsed = urlparse(url)
+            path = parsed.path or ""
+            if status == 403 and parsed.netloc.endswith("chatgpt.com") and path.startswith("/c/"):
+                raise ShareAccessError(
+                    "The provided link appears to be a private conversation. "
+                    "Open it while logged in and copy the public https://chatgpt.com/share/... link instead."
+                ) from exc
+            if attempt == total or status not in _RETRYABLE_STATUS_CODES:
+                raise
+            response = failed
+        except _FINAL_CONNECTION_EXCEPTIONS:
+            raise
+        except _RETRYABLE_EXCEPTIONS:
+            if attempt == total:
+                raise
+            response = None
+        else:
+            return response.text
+        sleep(_retry_delay(response, attempt))
+
+    # Unreachable: the final attempt either returns or re-raises above. Kept so
+    # the function has a return path the type checker can prove. Deliberately
+    # not a ShareAccessError, which check_fixture_links maps to "stale link".
+    raise RuntimeError(f"Could not fetch {url} after {total} attempts.")
 
 
 def extract_loader_payload(html: str) -> Optional[List[JsonValue]]:
@@ -1087,10 +1189,15 @@ def slugify_title(title: str, share_id: str) -> str:
 class ChatPeek:
     """High-level facade for downloading and exporting shared conversations."""
 
-    def __init__(self, link: str, options: Optional[ExportOptions] = None) -> None:
+    def __init__(
+        self,
+        link: str,
+        options: Optional[ExportOptions] = None,
+        attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    ) -> None:
         self._link: str = link
         self._options = options or ExportOptions()
-        html = fetch_share_page(link)
+        html = fetch_share_page(link, attempts=attempts)
         self._chat = parse_share_html(html, self._options)
 
     @property
@@ -1106,6 +1213,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         type=Path,
         default=EXPORT_ROOT,
         help="Destination directory for the exported conversation",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=DEFAULT_FETCH_ATTEMPTS,
+        help=(
+            "Attempts for the share fetch; connection errors, timeouts and "
+            "429/5xx responses are retried with a linear backoff (1 disables retrying)"
+        ),
     )
     parser.add_argument(
         "--skip-assets",
@@ -1130,7 +1246,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
-        html = fetch_share_page(args.share_url)
+        html = fetch_share_page(args.share_url, attempts=args.attempts)
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
