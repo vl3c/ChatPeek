@@ -282,7 +282,15 @@ _RETRYABLE_EXCEPTIONS = (
     requests.Timeout,
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ContentDecodingError,
+    # Only reachable if a caller mounts an adapter with max_retries set, since
+    # the requests default is 0. When it does fire the underlying cause was
+    # transient, so it belongs here -- note the attempts below then compose with
+    # that adapter's own retry budget rather than replacing it.
+    requests.exceptions.RetryError,
 )
+
+# TooManyRedirects is deliberately absent: a redirect loop is a property of the
+# URL, so it is final in the same way a 404 is.
 
 # Subclasses of ConnectionError whose cause is configuration rather than
 # congestion: a rejected certificate or an unreachable proxy answers the same
@@ -296,6 +304,18 @@ _FINAL_CONNECTION_EXCEPTIONS = (
 # backoff -- a fixed 5s wait against a limiter asking for 60s just re-trips it --
 # but cap it so a hostile or absurd Retry-After cannot park the CLI.
 _MAX_RETRY_AFTER_SECONDS: float = 60.0
+
+
+def _positive_int(value: str) -> int:
+    """argparse type for a count that must be at least 1."""
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or greater, got {parsed}")
+    return parsed
 
 
 def _retry_delay(response: Optional[requests.Response], attempt: int) -> float:
@@ -1216,7 +1236,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     )
     parser.add_argument(
         "--attempts",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_FETCH_ATTEMPTS,
         help=(
             "Attempts for the share fetch; connection errors, timeouts and "
