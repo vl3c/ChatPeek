@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, cast
+from typing import Any, Dict, List, Mapping, Optional, cast
 from unittest import mock
 
 import requests
@@ -1457,12 +1457,17 @@ class ParseShareHtmlTests(unittest.TestCase):
             parse_share_html("<html><body>nothing useful</body></html>")
 
 
-def _fetch_response(status: int, text: str = "<html></html>") -> mock.Mock:
+def _fetch_response(
+    status: int,
+    text: str = "<html></html>",
+    headers: Optional[Dict[str, str]] = None,
+) -> mock.Mock:
     """Build a mock Response that fails raise_for_status for non-2xx statuses."""
 
     response = mock.Mock(spec=requests.Response)
     response.status_code = status
     response.text = text
+    response.headers = headers if headers is not None else {}
     if status >= 400:
         response.raise_for_status.side_effect = requests.HTTPError(response=response)
     else:
@@ -1510,6 +1515,65 @@ class FetchSharePageTests(unittest.TestCase):
 
         self.assertEqual(html, "<html>ok</html>")
         self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(self.delays, [5.0])
+
+    @mock.patch("requests.get")
+    def test_body_read_failure_is_retried(self, mock_get: mock.Mock) -> None:
+        # stream=False reads the body inside requests.get, so a connection
+        # dropped mid-body raises here rather than surfacing as a status code.
+        mock_get.side_effect = [
+            requests.exceptions.ChunkedEncodingError("truncated body"),
+            _fetch_response(200, "<html>ok</html>"),
+        ]
+
+        html = fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(html, "<html>ok</html>")
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
+    def test_ssl_error_is_not_retried(self, mock_get: mock.Mock) -> None:
+        # A rejected certificate is deterministic: retrying delays the same error.
+        mock_get.side_effect = requests.exceptions.SSLError("bad certificate")
+
+        with self.assertRaises(requests.exceptions.SSLError):
+            fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(self.delays, [])
+
+    @mock.patch("requests.get")
+    def test_retry_after_overrides_backoff(self, mock_get: mock.Mock) -> None:
+        mock_get.side_effect = [
+            _fetch_response(429, headers={"Retry-After": "2"}),
+            _fetch_response(200, "<html>ok</html>"),
+        ]
+
+        html = fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(html, "<html>ok</html>")
+        self.assertEqual(self.delays, [2.0])
+
+    @mock.patch("requests.get")
+    def test_retry_after_is_capped(self, mock_get: mock.Mock) -> None:
+        mock_get.return_value = _fetch_response(429, headers={"Retry-After": "86400"})
+
+        with self.assertRaises(requests.HTTPError):
+            fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(self.delays, [60.0, 60.0])
+
+    @mock.patch("requests.get")
+    def test_http_date_retry_after_falls_back_to_backoff(self, mock_get: mock.Mock) -> None:
+        # The RFC also permits an HTTP-date, which is not parsed; back off instead.
+        mock_get.return_value = _fetch_response(
+            503, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        )
+
+        with self.assertRaises(requests.HTTPError):
+            fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(self.delays, [5.0, 10.0])
 
     @mock.patch("requests.get")
     def test_timeout_re_raises_after_exhausting_attempts(self, mock_get: mock.Mock) -> None:
@@ -1675,6 +1739,13 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
             self.assertEqual(len(md_files), 1)
             content = md_files[0].read_text(encoding="utf-8")
             self.assertIn("Gigawatt", content)
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_main_forwards_attempts(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = SHARE_FIXTURE.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            main(["https://chatgpt.com/share/abc", "--output", tmp, "--skip-assets", "--attempts", "7"])
+        self.assertEqual(mock_fetch.call_args.kwargs["attempts"], 7)
 
 
 class VariedShareFixtureTests(unittest.TestCase):
