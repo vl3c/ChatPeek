@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import re
@@ -1532,6 +1534,29 @@ class FetchSharePageTests(unittest.TestCase):
         self.assertEqual(mock_get.call_count, 2)
 
     @mock.patch("requests.get")
+    def test_adapter_retry_exhaustion_is_retried(self, mock_get: mock.Mock) -> None:
+        mock_get.side_effect = [
+            requests.exceptions.RetryError("adapter gave up"),
+            _fetch_response(200, "<html>ok</html>"),
+        ]
+
+        html = fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(html, "<html>ok</html>")
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
+    def test_redirect_loop_is_not_retried(self, mock_get: mock.Mock) -> None:
+        # A redirect loop is a property of the URL, so it is final like a 404.
+        mock_get.side_effect = requests.TooManyRedirects("loop")
+
+        with self.assertRaises(requests.TooManyRedirects):
+            fetch_share_page("https://chatgpt.com/share/abc", sleep=self._sleep)
+
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(self.delays, [])
+
+    @mock.patch("requests.get")
     def test_ssl_error_is_not_retried(self, mock_get: mock.Mock) -> None:
         # A rejected certificate is deterministic: retrying delays the same error.
         mock_get.side_effect = requests.exceptions.SSLError("bad certificate")
@@ -1746,6 +1771,19 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             main(["https://chatgpt.com/share/abc", "--output", tmp, "--skip-assets", "--attempts", "7"])
         self.assertEqual(mock_fetch.call_args.kwargs["attempts"], 7)
+
+    def test_main_rejects_non_positive_attempts(self) -> None:
+        cases = (("0", "1 or greater"), ("-3", "1 or greater"), ("many", "expected an integer"))
+        for bad, expected in cases:
+            with self.subTest(attempts=bad):
+                # argparse prints usage to stderr; capture it so the suite output
+                # stays clean and the message itself can be asserted.
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main(["https://chatgpt.com/share/abc", "--attempts", bad])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
 
 
 class VariedShareFixtureTests(unittest.TestCase):
