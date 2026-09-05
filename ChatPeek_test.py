@@ -415,6 +415,7 @@ class ChatPeekModuleTests(unittest.TestCase):
         fetch_share_page("https://chatgpt.com/share/abc")
         args, kwargs = mock_get.call_args
         self.assertIn("Referer", kwargs["headers"])
+        self.assertEqual(kwargs["headers"].get("Connection"), "close")
         self.assertTrue(kwargs["headers"]["User-Agent"].startswith("Mozilla"))
 
     @mock.patch("requests.get")
@@ -1785,6 +1786,23 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn(expected, stderr.getvalue())
 
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_main_forwards_timeout(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = SHARE_FIXTURE.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            main(["https://chatgpt.com/share/abc", "--output", tmp, "--skip-assets", "--timeout", "25"])
+        self.assertEqual(mock_fetch.call_args.kwargs["timeout"], 25)
+
+    def test_main_rejects_non_positive_timeout(self) -> None:
+        cases = (("0", "1 or greater"), ("-5", "1 or greater"), ("fast", "expected an integer"))
+        for bad, expected in cases:
+            with self.subTest(timeout=bad):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main(["https://chatgpt.com/share/abc", "--timeout", bad])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
 
 class VariedShareFixtureTests(unittest.TestCase):
     """Coverage over a share export whose content is deliberately varied:
