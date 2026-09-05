@@ -34,6 +34,7 @@ DEFAULT_HEADERS: Dict[str, str] = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "close",
 }
 
 
@@ -1244,6 +1245,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         ),
     )
     parser.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=15,
+        help="Per-attempt request timeout in seconds (default: 15)",
+    )
+    parser.add_argument(
         "--skip-assets",
         action="store_true",
         help="Do not download linked assets (images, attachments)",
@@ -1266,7 +1273,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
-        html = fetch_share_page(args.share_url, attempts=args.attempts)
+        html = fetch_share_page(args.share_url, timeout=args.timeout, attempts=args.attempts)
     except ShareAccessError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
