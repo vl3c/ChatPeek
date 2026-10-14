@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 from unittest import mock
 
 import requests
+from requests.structures import CaseInsensitiveDict
 
 from check_fixture_links import FIXTURE_LINKS, check_fixture_link
 
@@ -2406,7 +2407,7 @@ class ClaudeShareTests(unittest.TestCase):
     def test_fetch_claude_snapshot_names_bot_challenge(self, mock_fetch: mock.Mock) -> None:
         error = self._http_error(403)
         assert error.response is not None
-        error.response.headers = {"cf-mitigated": "challenge"}
+        error.response.headers = CaseInsensitiveDict({"cf-mitigated": "challenge"})
         mock_fetch.side_effect = error
         with self.assertRaises(ShareAccessError) as ctx:
             fetch_claude_snapshot(CLAUDE_SHARE_URL)
