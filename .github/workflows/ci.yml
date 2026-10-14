@@ -18,16 +18,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on PR updates only. Master pushes and the weekly
+  # link check each run to completion, so a merge commit never ends up with a
+  # cancelled (never verified) check.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     # Offline unit tests: replay saved fixtures, no network.
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+        with:
+          # Nothing pushes back, so keep the token out of .git/config.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+          cache: pip
+          cache-dependency-path: requirements.txt
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt
       - run: python -m mypy .
@@ -38,11 +51,17 @@ jobs:
     # Runs on the weekly schedule and on manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+        with:
+          # Nothing pushes back, so keep the token out of .git/config.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+          cache: pip
+          cache-dependency-path: requirements.txt
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt
       - run: python check_fixture_links.py
