@@ -1,0 +1,193 @@
+{
+  "uuid": "3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b",
+  "snapshot_name": "Fibonacci helper and a quick search",
+  "created_at": "2026-10-14T10:00:00.000000Z",
+  "updated_at": "2026-10-14T10:05:00.000000Z",
+  "creator": {
+    "full_name": "Example"
+  },
+  "chat_messages": [
+    {
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "index": 1,
+      "sender": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "The user wants a Fibonacci function.\nAn iterative version avoids recursion limits.",
+          "summaries": [
+            {
+              "summary": "Planning the function"
+            }
+          ],
+          "cut_off": false
+        },
+        {
+          "type": "text",
+          "text": "Here is an iterative version, plus a comparison table:\n\n| n | fib(n) |\n|---|--------|\n| 10 | 55 |\n| 20 | 6765 |",
+          "start_timestamp": null,
+          "stop_timestamp": null,
+          "citations": []
+        },
+        {
+          "type": "tool_use",
+          "name": "artifacts",
+          "input": {
+            "id": "fib",
+            "type": "application/vnd.ant.code",
+            "title": "fib.py",
+            "command": "create",
+            "language": "python",
+            "content": "def fib(n: int) -> int:\n    \"\"\"Return the n-th Fibonacci number.\n\n    ```\n    >>> fib(10)\n    55\n    ```\n    \"\"\"\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n",
+            "version_uuid": "v1"
+          },
+          "message": null
+        },
+        {
+          "type": "tool_result",
+          "name": "artifacts",
+          "content": [
+            {
+              "type": "text",
+              "text": "OK",
+              "uuid": "r1"
+            }
+          ],
+          "is_error": false
+        }
+      ],
+      "created_at": "2026-10-14T10:01:00.000000Z",
+      "updated_at": "2026-10-14T10:01:00.000000Z",
+      "truncated": false,
+      "attachments": [],
+      "files": [],
+      "files_v2": [],
+      "sync_sources": [],
+      "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+    },
+    {
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "index": 0,
+      "sender": "human",
+      "content": [
+        {
+          "type": "text",
+          "text": "Write me a Python fib function. My notes are attached.",
+          "start_timestamp": null,
+          "stop_timestamp": null,
+          "citations": []
+        }
+      ],
+      "created_at": "2026-10-14T10:00:00.000000Z",
+      "updated_at": "2026-10-14T10:00:00.000000Z",
+      "truncated": false,
+      "attachments": [
+        {
+          "file_name": "notes.txt",
+          "file_type": "txt",
+          "file_size": 42,
+          "extracted_content": "Must be iterative.\nMust handle n = 0."
+        }
+      ],
+      "files": [
+        {
+          "file_kind": "image",
+          "file_uuid": "img-1",
+          "file_name": "whiteboard.png"
+        }
+      ],
+      "files_v2": [
+        {
+          "file_kind": "image",
+          "file_uuid": "img-1",
+          "file_name": "whiteboard.png",
+          "preview_url": "/api/org/files/img-1/preview"
+        }
+      ],
+      "sync_sources": [],
+      "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+    },
+    {
+      "uuid": "00000000-0000-4000-8000-000000000002",
+      "index": 2,
+      "sender": "human",
+      "content": [
+        {
+          "type": "text",
+          "text": "Rename it to fibonacci, and what is the 50th number?",
+          "start_timestamp": null,
+          "stop_timestamp": null,
+          "citations": []
+        }
+      ],
+      "created_at": "2026-10-14T10:02:00.000000Z",
+      "updated_at": "2026-10-14T10:02:00.000000Z",
+      "truncated": false,
+      "attachments": [],
+      "files": [],
+      "files_v2": [],
+      "sync_sources": [],
+      "parent_message_uuid": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "uuid": "00000000-0000-4000-8000-000000000003",
+      "index": 3,
+      "sender": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "name": "artifacts",
+          "input": {
+            "id": "fib",
+            "command": "update",
+            "title": "fib.py",
+            "old_str": "def fib(n: int) -> int:",
+            "new_str": "def fibonacci(n: int) -> int:",
+            "version_uuid": "v2"
+          }
+        },
+        {
+          "type": "tool_use",
+          "name": "web_search",
+          "input": {
+            "query": "50th fibonacci number"
+          }
+        },
+        {
+          "type": "tool_result",
+          "name": "web_search",
+          "content": [
+            {
+              "type": "knowledge",
+              "title": "Fibonacci number - Wikipedia",
+              "url": "https://en.wikipedia.org/wiki/Fibonacci_number",
+              "text": "F(50) = 12586269025"
+            }
+          ],
+          "is_error": false
+        },
+        {
+          "type": "some_future_block",
+          "payload": {
+            "x": 1
+          }
+        },
+        {
+          "type": "text",
+          "text": "Renamed. The 50th Fibonacci number is 12,586,269,025.",
+          "start_timestamp": null,
+          "stop_timestamp": null,
+          "citations": []
+        }
+      ],
+      "created_at": "2026-10-14T10:03:00.000000Z",
+      "updated_at": "2026-10-14T10:03:00.000000Z",
+      "truncated": false,
+      "attachments": [],
+      "files": [],
+      "files_v2": [],
+      "sync_sources": [],
+      "parent_message_uuid": "00000000-0000-4000-8000-000000000002"
+    }
+  ]
+}

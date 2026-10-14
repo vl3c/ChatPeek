@@ -1,4 +1,4 @@
-"""Utilities for exporting ChatGPT shared conversations to Markdown."""
+"""Utilities for exporting ChatGPT and Claude shared conversations to Markdown."""
 
 from __future__ import annotations
 
@@ -152,20 +152,34 @@ class Reply:
     assets: List[ConversationAsset] = field(default_factory=list)
 
 
+def _strip_line_end(line: str) -> str:
+    """Trim trailing whitespace, keeping a Markdown hard line break.
+
+    Two or more trailing spaces after text are Markdown's hard break, so they
+    are normalised to exactly two rather than dropped.
+    """
+
+    stripped = line.rstrip()
+    if stripped and line.endswith("  ") and line[len(stripped):].strip(" ") == "":
+        return stripped + "  "
+    return stripped
+
+
 @dataclass
 class Chat:
-    """Structured representation of a shared ChatGPT conversation."""
+    """Structured representation of a shared ChatGPT or Claude conversation."""
 
     share_id: str
     ai_model: str
     title: str
     updated_at: Optional[float]
     replies: List[Reply]
+    source: str = "ChatGPT"
 
     def to_markdown(self) -> str:
         """Render the conversation as a Markdown string."""
 
-        header_lines = [f"# {self.title or 'ChatGPT conversation'}"]
+        header_lines = [f"# {self.title or self.source + ' conversation'}"]
         meta_bits = []
         if self.updated_at:
             meta_bits.append(
@@ -183,7 +197,7 @@ class Chat:
             header_lines.append(reply.statement.strip())
             header_lines.append("")
 
-        return "\n".join(line.rstrip() for line in header_lines).rstrip() + "\n"
+        return "\n".join(_strip_line_end(line) for line in "\n".join(header_lines).split("\n")).rstrip() + "\n"
 
     def save_markdown(
         self,
@@ -777,6 +791,336 @@ def parse_share_html(html: str, options: Optional[ExportOptions] = None) -> Chat
             return parse_legacy_share(html, options)
 
 
+# --- Claude (claude.ai) shares -------------------------------------------------
+#
+# A claude.ai/share/<uuid> page is a client-rendered shell with no conversation
+# in it: the browser fetches the snapshot from a public JSON endpoint instead.
+# ChatPeek requests that endpoint directly, the same one the page itself calls.
+
+CLAUDE_SHARE_PATTERN = re.compile(
+    r"^/share/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})/?$"
+)
+CLAUDE_SNAPSHOT_URL = (
+    "https://claude.ai/api/chat_snapshots/{share_id}"
+    "?rendering_mode=messages&render_all_tools=true"
+)
+
+# Artifact MIME types mapped to the fence language used for their source.
+_CLAUDE_ARTIFACT_LANGUAGES: Dict[str, str] = {
+    "text/markdown": "markdown",
+    "text/html": "html",
+    "image/svg+xml": "svg",
+    "application/vnd.ant.react": "jsx",
+    "application/vnd.ant.mermaid": "mermaid",
+}
+
+
+def claude_share_id(url: str) -> Optional[str]:
+    """Return the share UUID if url is a https://claude.ai/share/<uuid> link."""
+
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in ("http", "https") or host not in ("claude.ai", "www.claude.ai"):
+        return None
+    match = CLAUDE_SHARE_PATTERN.match(parsed.path or "")
+    return match.group(1).lower() if match else None
+
+
+def _code_fence(body: str, language: str = "") -> str:
+    """Fence body in backticks longer than any run it contains."""
+
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{language}\n{body.rstrip()}\n{fence}"
+
+
+def _blockquote(text: str) -> str:
+    return "\n".join(f"> {line}" if line else ">" for line in text.strip().splitlines())
+
+
+def _parse_iso_timestamp(value: object) -> Optional[float]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        # fromisoformat accepts a trailing "Z" from Python 3.11 on; normalise it
+        # anyway so the parse does not depend on the interpreter version.
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _render_claude_artifact(tool_input: Mapping[str, Any]) -> str:
+    """Render an artifacts tool call as the artifact's source code."""
+
+    title_raw = tool_input.get("title")
+    title = title_raw if isinstance(title_raw, str) and title_raw else "Untitled artifact"
+    command = tool_input.get("command")
+    if command == "update":
+        old_raw = tool_input.get("old_str")
+        new_raw = tool_input.get("new_str")
+        old = old_raw if isinstance(old_raw, str) else ""
+        new = new_raw if isinstance(new_raw, str) else ""
+        return "\n\n".join(
+            [f"**Artifact updated: {title}**", "Replaced:", _code_fence(old), "With:", _code_fence(new)]
+        )
+    content_raw = tool_input.get("content")
+    if not isinstance(content_raw, str) or not content_raw.strip():
+        return ""
+    language_raw = tool_input.get("language")
+    artifact_type = tool_input.get("type")
+    if isinstance(language_raw, str) and language_raw:
+        language = language_raw
+    elif isinstance(artifact_type, str):
+        language = _CLAUDE_ARTIFACT_LANGUAGES.get(artifact_type, "")
+    else:
+        language = ""
+    return f"**Artifact: {title}**\n\n{_code_fence(content_raw, language)}"
+
+
+def _render_claude_tool_result(item: Mapping[str, Any]) -> str:
+    name_raw = item.get("name")
+    name = name_raw if isinstance(name_raw, str) and name_raw else "tool"
+    texts: List[str] = []
+    content = item.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+            else:
+                title = part.get("title")
+                url = part.get("url")
+                if isinstance(title, str) and isinstance(url, str):
+                    texts.append(f"{title} - {url}")
+    elif isinstance(content, str) and content.strip():
+        texts.append(content.strip())
+    if not texts:
+        return ""
+    label = "Tool error" if item.get("is_error") else "Tool result"
+    return f"*{label} ({name}):*\n\n{_code_fence(chr(10).join(texts), 'text')}"
+
+
+def _render_claude_content(item: Mapping[str, Any], options: ExportOptions) -> str:
+    content_type = item.get("type")
+    if content_type == "text":
+        text = item.get("text")
+        return text.strip() if isinstance(text, str) else ""
+    if content_type == "thinking":
+        if not options.include_reasoning:
+            return ""
+        thinking = item.get("thinking")
+        if not isinstance(thinking, str) or not thinking.strip():
+            return ""
+        return _blockquote(f"**Thinking**\n\n{thinking.strip()}")
+    if content_type == "voice_note":
+        text = item.get("text")
+        return text.strip() if isinstance(text, str) else ""
+    if content_type == "tool_use":
+        tool_input_raw = item.get("input")
+        tool_input: Mapping[str, Any] = tool_input_raw if isinstance(tool_input_raw, Mapping) else {}
+        # Artifacts are the answer itself rather than tool plumbing, so they are
+        # always exported; every other tool call is opt-in like on ChatGPT.
+        if item.get("name") == "artifacts":
+            return _render_claude_artifact(tool_input)
+        if not options.include_tool_output:
+            return ""
+        name_raw = item.get("name")
+        name = name_raw if isinstance(name_raw, str) and name_raw else "tool"
+        body = json.dumps(tool_input, indent=2, ensure_ascii=False)
+        return f"*Tool call: {name}*\n\n{_code_fence(body, 'json')}"
+    if content_type == "tool_result":
+        if not options.include_tool_output or item.get("name") == "artifacts":
+            return ""
+        return _render_claude_tool_result(item)
+    return ""
+
+
+def _render_claude_files(message: Mapping[str, Any]) -> List[str]:
+    """Describe pasted text, uploaded documents and images on a message.
+
+    Uploaded files are only reachable with the sharer's session cookie, so
+    images are noted by name rather than downloaded; documents whose text
+    claude.ai extracted are inlined in a collapsible block.
+    """
+
+    blocks: List[str] = []
+    attachments = message.get("attachments")
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            name_raw = attachment.get("file_name")
+            name = name_raw if isinstance(name_raw, str) and name_raw else "Pasted content"
+            extracted = attachment.get("extracted_content")
+            if isinstance(extracted, str) and extracted.strip():
+                blocks.append(
+                    f"<details>\n<summary>Attachment: {name}</summary>\n\n"
+                    f"{_code_fence(extracted, 'text')}\n\n</details>"
+                )
+            else:
+                blocks.append(f"*Attachment '{name}' not included in export.*")
+
+    seen: Set[str] = set()
+    for key in ("files_v2", "files"):
+        files = message.get(key)
+        if not isinstance(files, list):
+            continue
+        for entry in files:
+            if not isinstance(entry, Mapping):
+                continue
+            identity = entry.get("file_uuid") or entry.get("file_name")
+            if isinstance(identity, str):
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            name_raw = entry.get("file_name")
+            name = name_raw if isinstance(name_raw, str) and name_raw else "file"
+            kind = "Image" if entry.get("file_kind") == "image" else "File"
+            blocks.append(f"*{kind} '{name}' not included in export.*")
+    return blocks
+
+
+def parse_claude_snapshot(body: str, options: Optional[ExportOptions] = None) -> Chat:
+    """Build a Chat from a claude.ai chat_snapshots JSON response."""
+
+    export_options = options or ExportOptions()
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Claude share response is not JSON") from exc
+    if not isinstance(data, Mapping) or not isinstance(data.get("chat_messages"), list):
+        raise ValueError("Claude share response has no chat_messages")
+
+    share_id_raw = data.get("uuid")
+    share_id = share_id_raw if isinstance(share_id_raw, str) and share_id_raw else "shared"
+    title = ""
+    for key in ("snapshot_name", "name"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            title = value.strip()
+            break
+    model_raw = data.get("model")
+    model = model_raw if isinstance(model_raw, str) else ""
+    updated_at = _parse_iso_timestamp(data.get("updated_at")) or _parse_iso_timestamp(
+        data.get("created_at")
+    )
+
+    messages = [m for m in data["chat_messages"] if isinstance(m, Mapping)]
+    # index is the position in the shared branch; fall back to list order.
+    def message_index(message: Mapping[str, Any]) -> int:
+        index = message.get("index")
+        return index if isinstance(index, int) else 0
+
+    messages.sort(key=message_index)
+
+    replies: List[Reply] = []
+    for message in messages:
+        sender = message.get("sender")
+        content = message.get("content")
+        parts: List[str] = []
+        if isinstance(content, list) and content:
+            for item in content:
+                if isinstance(item, Mapping):
+                    rendered = _render_claude_content(item, export_options)
+                    if rendered:
+                        parts.append(rendered)
+        else:
+            # Older snapshots carry only the flat text field.
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        parts.extend(_render_claude_files(message))
+        statement = "\n\n".join(parts)
+        if not statement:
+            continue
+        is_human = sender == "human"
+        replies.append(
+            Reply(
+                author_name="User" if is_human else "Claude",
+                type=ReplyType.HUMAN if is_human else ReplyType.AI,
+                statement=statement,
+                created_at=_parse_iso_timestamp(message.get("created_at")),
+            )
+        )
+
+    return Chat(
+        share_id=share_id,
+        ai_model=model,
+        title=title,
+        updated_at=updated_at,
+        replies=replies,
+        source="Claude",
+    )
+
+
+def fetch_claude_snapshot(
+    share_url: str,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Fetch the JSON snapshot behind a claude.ai share link.
+
+    Raises:
+        ValueError: share_url is not a claude.ai share link.
+        ShareAccessError: claude.ai refused the request (unshared link or a
+            bot challenge).
+        requests.RequestException: Any other failure after retries.
+    """
+
+    share_id = claude_share_id(share_url)
+    if share_id is None:
+        raise ValueError(f"Not a claude.ai share link: {share_url}")
+    headers = {
+        "Accept": "application/json",
+        "Referer": f"https://claude.ai/share/{share_id}",
+    }
+    try:
+        return fetch_share_page(
+            CLAUDE_SNAPSHOT_URL.format(share_id=share_id),
+            headers=headers,
+            attempts=attempts,
+            sleep=sleep,
+        )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        headers = getattr(exc.response, "headers", None) or {}
+        if status == 403 and headers.get("cf-mitigated") == "challenge":
+            raise ShareAccessError(
+                "claude.ai's bot protection challenged the request (HTTP 403). This is "
+                "common from cloud servers and VPNs; retry from a home connection."
+            ) from exc
+        if status == 403:
+            raise ShareAccessError(
+                "claude.ai refused the request (HTTP 403). Either the link is no longer "
+                "shared, or claude.ai's bot protection challenged it, which is common from "
+                "cloud servers and VPNs. Check the link opens in a private browser window, "
+                "then retry from a home connection."
+            ) from exc
+        if status == 404:
+            raise ShareAccessError(
+                "claude.ai has no shared conversation at this link (HTTP 404). "
+                "It may have been unshared or deleted."
+            ) from exc
+        raise
+
+
+def load_share(
+    link: str,
+    options: Optional[ExportOptions] = None,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+) -> Chat:
+    """Fetch and parse a ChatGPT or Claude share link."""
+
+    if claude_share_id(link) is not None:
+        return parse_claude_snapshot(fetch_claude_snapshot(link, attempts=attempts), options)
+    return parse_share_html(fetch_share_page(link, attempts=attempts), options)
+
+
 def author_name_for_role(role: Optional[str]) -> str:
     if role == "user":
         return "User"
@@ -1217,8 +1561,7 @@ class ChatPeek:
     ) -> None:
         self._link: str = link
         self._options = options or ExportOptions()
-        html = fetch_share_page(link, attempts=attempts)
-        self._chat = parse_share_html(html, self._options)
+        self._chat = load_share(link, self._options, attempts=attempts)
 
     @property
     def chat(self) -> Chat:
@@ -1226,8 +1569,8 @@ class ChatPeek:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Export a ChatGPT share link to Markdown")
-    parser.add_argument("share_url", help="The https://chatgpt.com/share/... link to export")
+    parser = argparse.ArgumentParser(description="Export a ChatGPT or Claude share link to Markdown")
+    parser.add_argument("share_url", help="The https://chatgpt.com/share/... or https://claude.ai/share/... link to export")
     parser.add_argument(
         "--output",
         type=Path,
@@ -1265,17 +1608,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    try:
-        html = fetch_share_page(args.share_url, attempts=args.attempts)
-    except ShareAccessError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
     export_options = ExportOptions(
         include_reasoning=args.include_reasoning,
         include_tool_output=args.include_tool_output,
         include_model_context=args.include_model_context,
     )
-    chat = parse_share_html(html, export_options)
+    try:
+        chat = load_share(args.share_url, export_options, attempts=args.attempts)
+    except ShareAccessError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     markdown_path = chat.save_markdown(args.output, download_assets=not args.skip_assets)
     print(markdown_path)
 
