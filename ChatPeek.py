@@ -152,6 +152,19 @@ class Reply:
     assets: List[ConversationAsset] = field(default_factory=list)
 
 
+def _strip_line_end(line: str) -> str:
+    """Trim trailing whitespace, keeping a Markdown hard line break.
+
+    Two or more trailing spaces after text are Markdown's hard break, so they
+    are normalised to exactly two rather than dropped.
+    """
+
+    stripped = line.rstrip()
+    if stripped and line.endswith("  ") and line[len(stripped):].strip(" ") == "":
+        return stripped + "  "
+    return stripped
+
+
 @dataclass
 class Chat:
     """Structured representation of a shared ChatGPT or Claude conversation."""
@@ -184,7 +197,7 @@ class Chat:
             header_lines.append(reply.statement.strip())
             header_lines.append("")
 
-        return "\n".join(line.rstrip() for line in header_lines).rstrip() + "\n"
+        return "\n".join(_strip_line_end(line) for line in "\n".join(header_lines).split("\n")).rstrip() + "\n"
 
     def save_markdown(
         self,

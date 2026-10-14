@@ -61,6 +61,9 @@ VARIED_FIXTURE: Path = FIXTURES / "69b1c492-1540-8006-aa29-ee2e0a831385.html"
 # share), covering text, thinking, artifacts, tools, attachments and images.
 CLAUDE_FIXTURE: Path = FIXTURES / "claude-snapshot-synthetic.json"
 CLAUDE_SHARE_URL = "https://claude.ai/share/3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b"
+# Captured once from a real public share (claude.ai/share/a848f926-...): plain
+# text turns stress-testing Markdown, code, Unicode and special characters.
+CLAUDE_LIVE_FIXTURE: Path = FIXTURES / "a848f926-95db-4fd2-83e6-d497d5f71b1b.json"
 
 
 class ChatPeekModuleTests(unittest.TestCase):
@@ -2250,6 +2253,21 @@ class AssetNamerTests(unittest.TestCase):
         self.assertNotEqual(assets_a[0].filename, assets_b[0].filename)
 
 
+class MarkdownLineEndTests(unittest.TestCase):
+    def _render(self, statement: str) -> str:
+        reply = Reply(author_name="User", type=ReplyType.HUMAN, statement=statement)
+        return Chat(share_id="x", ai_model="", title="t", updated_at=None, replies=[reply]).to_markdown()
+
+    def test_keeps_hard_line_break(self) -> None:
+        self.assertIn("first  \nsecond", self._render("first  \nsecond"))
+        # Longer runs normalise to the two spaces Markdown needs.
+        self.assertIn("first  \nsecond", self._render("first    \nsecond"))
+
+    def test_strips_other_trailing_whitespace(self) -> None:
+        markdown = self._render("one \ntwo\t\nthree")
+        self.assertIn("one\ntwo\nthree", markdown)
+
+
 class ClaudeShareTests(unittest.TestCase):
     def setUp(self) -> None:
         self.body: str = CLAUDE_FIXTURE.read_text(encoding="utf-8")
@@ -2338,6 +2356,29 @@ class ClaudeShareTests(unittest.TestCase):
             md_path = chat.save_markdown(Path(tmp))
             self.assertEqual(md_path.name, "fibonacci-helper-and-a-quick-search-3f2b9c1e.md")
             self.assertEqual(md_path.parent, Path(tmp))
+
+    def test_parse_real_claude_snapshot(self) -> None:
+        raw = CLAUDE_LIVE_FIXTURE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        chat = parse_claude_snapshot(raw)
+        self.assertEqual(chat.title, "Paragraph writing")
+        self.assertEqual(len(chat.replies), len(data["chat_messages"]))
+        self.assertEqual(chat.replies[0].statement, "write a paragraph, dealers choice")
+        # Every text block survives verbatim, in order.
+        ordered = sorted(data["chat_messages"], key=lambda m: m["index"])
+        for message, reply in zip(ordered, chat.replies):
+            expected = "\n\n".join(
+                block["text"].strip() for block in message["content"] if block["type"] == "text"
+            )
+            self.assertEqual(reply.statement, expected)
+
+    def test_real_claude_snapshot_markdown_keeps_special_content(self) -> None:
+        markdown = parse_claude_snapshot(CLAUDE_LIVE_FIXTURE.read_text(encoding="utf-8")).to_markdown()
+        self.assertTrue(markdown.startswith("# Paragraph writing\n"))
+        self.assertIn("# Why `0.1 + 0.2 != 0.3`", markdown)
+        self.assertIn("```mermaid", markdown)
+        self.assertIn("\U0001F468\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466", markdown)
+        self.assertIn("Hard break with two trailing spaces  \n", markdown)
 
     @mock.patch("ChatPeek.fetch_share_page")
     def test_fetch_claude_snapshot_requests_api_endpoint(self, mock_fetch: mock.Mock) -> None:

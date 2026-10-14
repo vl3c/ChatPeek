@@ -48,7 +48,7 @@ print(markdown_path)
 
 ## Testing
 
-All behaviour is covered by unit tests. They replay saved HTML fixtures under `fixtures/` (no live traffic), so they keep passing even after a share link expires. Run them with:
+All behaviour is covered by unit tests. They replay saved fixtures under `fixtures/` (ChatGPT share HTML and Claude snapshot JSON, no live traffic), so they keep passing even after a share link expires. Run them with:
 
 ```bash
 python -m unittest ChatPeek_test.py
