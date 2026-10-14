@@ -1,11 +1,14 @@
-# ChatPeek - export ChatGPT shares to Markdown
+# ChatPeek - export ChatGPT and Claude shares to Markdown
 
 ChatPeek downloads an individual `chatgpt.com/share/...` link (using the same headers a private browser tab would send), rebuilds the conversation offline, and turns it into clean Markdown. When the conversation points to downloadable assets (images, attachments), the exporter can create a conversation folder containing the Markdown plus the referenced files.
+
+Claude `claude.ai/share/...` links work the same way. Their page carries no conversation of its own, so ChatPeek reads the public JSON snapshot that the page loads (`claude.ai/api/chat_snapshots/<id>`).
 
 ## Features
 
 - Single-request fetch with private-window style headers (no retry loop or backend probing)
 - React Flight parser for modern `chatgpt.com` shares with a legacy fallback for older `chat.openai.com` pages
+- Claude share support: messages, artifacts (as source code), pasted and uploaded text attachments, with thinking and tool calls behind the same opt-in flags
 - Message normalisation that keeps Markdown tables, code blocks, thoughts, tool outputs, and attachment links
 - Markdown writer with optional asset download (`images/` and `attachments/` subfolders when needed)
 - Lightweight CLI: `python ChatPeek.py <share-url>` writes the Markdown to disk
@@ -16,7 +19,10 @@ ChatPeek downloads an individual `chatgpt.com/share/...` link (using the same he
 python -m pip install -r requirements.txt  # requests + beautifulsoup4
 python ChatPeek.py https://chatgpt.com/share/69b1c492-1540-8006-aa29-ee2e0a831385
 # -> ./hybrid-cognitive-systems-69b1c492.md
+python ChatPeek.py https://claude.ai/share/<share-id>
 ```
+
+For Claude shares, uploaded images and files are only reachable while signed in, so the export names them instead of downloading them. Documents whose text Claude extracted (pasted text, PDFs, text files) are included inline. claude.ai's bot protection sometimes challenges requests from cloud servers or VPNs; ChatPeek reports that as an access error, and retrying from a home connection usually works.
 
 The share fetch makes up to three attempts (two retries) on transient failures - connection errors, timeouts, truncated responses, and HTTP 429/5xx - backing off 5s then 10s, or honouring a `Retry-After` header when the server sends one. A deterministic answer such as a deleted share or a private conversation fails immediately instead, since retrying it would return the same result. Pass `--attempts 1` to disable retrying, or a higher count on an unreliable connection.
 

@@ -27,13 +27,17 @@ from ChatPeek import (
     _extract_scripts,
     author_name_for_role,
     build_asset_filename,
+    claude_share_id,
     decode_loader,
     default_http_get,
     extract_loader_payload,
+    fetch_claude_snapshot,
     fetch_share_page,
     flatten_message_content,
     is_allowed_asset_url,
     main,
+    load_share,
+    parse_claude_snapshot,
     parse_legacy_share,
     parse_modern_share,
     parse_post_share,
@@ -53,6 +57,10 @@ SHARE_FIXTURE: Path = FIXTURES / "690781ed-75f0-8006-9d6e-d9229bd932f2.html"
 # Markdown) captured as HTML so the tests keep exercising those paths even
 # after the live share link expires.
 VARIED_FIXTURE: Path = FIXTURES / "69b1c492-1540-8006-aa29-ee2e0a831385.html"
+# Hand-built to the claude.ai chat_snapshots schema (not captured from a live
+# share), covering text, thinking, artifacts, tools, attachments and images.
+CLAUDE_FIXTURE: Path = FIXTURES / "claude-snapshot-synthetic.json"
+CLAUDE_SHARE_URL = "https://claude.ai/share/3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b"
 
 
 class ChatPeekModuleTests(unittest.TestCase):
@@ -2240,6 +2248,161 @@ class AssetNamerTests(unittest.TestCase):
         _, assets_a = flatten_message_content("m-a", message_a["content"], message_a, namer=namer)
         _, assets_b = flatten_message_content("m-b", message_b["content"], message_b, namer=namer)
         self.assertNotEqual(assets_a[0].filename, assets_b[0].filename)
+
+
+class ClaudeShareTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.body: str = CLAUDE_FIXTURE.read_text(encoding="utf-8")
+
+    def _http_error(self, status: int) -> requests.HTTPError:
+        response = mock.Mock(spec=requests.Response)
+        response.status_code = status
+        response.headers = {}
+        return requests.HTTPError(response=response)
+
+    def test_claude_share_id_accepts_share_links(self) -> None:
+        share_id = "3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b"
+        self.assertEqual(claude_share_id(CLAUDE_SHARE_URL), share_id)
+        self.assertEqual(claude_share_id(f"https://claude.ai/share/{share_id.upper()}/"), share_id)
+        self.assertEqual(claude_share_id(f"https://www.claude.ai/share/{share_id}?x=1"), share_id)
+
+    def test_claude_share_id_rejects_other_links(self) -> None:
+        share_id = "3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b"
+        self.assertIsNone(claude_share_id(f"https://claude.ai/chat/{share_id}"))
+        self.assertIsNone(claude_share_id(f"https://claude.ai.evil.com/share/{share_id}"))
+        self.assertIsNone(claude_share_id(f"https://chatgpt.com/share/{share_id}"))
+        self.assertIsNone(claude_share_id("https://claude.ai/share/not-a-uuid"))
+        self.assertIsNone(claude_share_id(f"ftp://claude.ai/share/{share_id}"))
+
+    def test_parse_claude_snapshot_metadata(self) -> None:
+        chat = parse_claude_snapshot(self.body)
+        self.assertEqual(chat.share_id, "3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b")
+        self.assertEqual(chat.title, "Fibonacci helper and a quick search")
+        self.assertEqual(chat.source, "Claude")
+        self.assertIsNotNone(chat.updated_at)
+
+    def test_parse_claude_snapshot_orders_by_index(self) -> None:
+        chat = parse_claude_snapshot(self.body)
+        self.assertEqual([r.type for r in chat.replies], [ReplyType.HUMAN, ReplyType.AI] * 2)
+        self.assertEqual([r.author_name for r in chat.replies], ["User", "Claude"] * 2)
+        self.assertTrue(chat.replies[0].statement.startswith("Write me a Python fib function"))
+
+    def test_parse_claude_snapshot_default_export(self) -> None:
+        markdown = parse_claude_snapshot(self.body).to_markdown()
+        self.assertIn("| 20 | 6765 |", markdown)
+        self.assertIn("**Artifact: fib.py**", markdown)
+        self.assertIn("````python\ndef fib(n: int) -> int:", markdown)
+        self.assertIn("**Artifact updated: fib.py**", markdown)
+        self.assertIn("def fibonacci(n: int) -> int:", markdown)
+        self.assertIn("<summary>Attachment: notes.txt</summary>", markdown)
+        self.assertIn("Must be iterative.", markdown)
+        self.assertEqual(markdown.count("Image 'whiteboard.png' not included"), 1)
+        self.assertIn("12,586,269,025", markdown)
+        self.assertNotIn("avoids recursion limits", markdown)
+        self.assertNotIn("web_search", markdown)
+        self.assertNotIn("some_future_block", markdown)
+
+    def test_parse_claude_snapshot_includes_internal_content_on_request(self) -> None:
+        options = ExportOptions(include_reasoning=True, include_tool_output=True)
+        markdown = parse_claude_snapshot(self.body, options).to_markdown()
+        self.assertIn("> **Thinking**", markdown)
+        self.assertIn("> An iterative version avoids recursion limits.", markdown)
+        self.assertIn("*Tool call: web_search*", markdown)
+        self.assertIn("F(50) = 12586269025", markdown)
+        # The artifacts tool's own "OK" acknowledgement is noise, never exported.
+        self.assertNotIn("Tool result (artifacts)", markdown)
+
+    def test_parse_claude_snapshot_falls_back_to_text_field(self) -> None:
+        body = json.dumps(
+            {
+                "uuid": "abc",
+                "chat_messages": [
+                    {"index": 0, "sender": "human", "text": "hello", "content": []},
+                    {"index": 1, "sender": "assistant", "text": "hi there"},
+                ],
+            }
+        )
+        chat = parse_claude_snapshot(body)
+        self.assertEqual([r.statement for r in chat.replies], ["hello", "hi there"])
+        self.assertTrue(chat.to_markdown().startswith("# Claude conversation"))
+
+    def test_parse_claude_snapshot_rejects_non_snapshot(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_claude_snapshot("<!DOCTYPE html><title>Just a moment...</title>")
+        with self.assertRaises(ValueError):
+            parse_claude_snapshot(json.dumps({"error": "not found"}))
+
+    def test_save_markdown_uses_title_slug(self) -> None:
+        chat = parse_claude_snapshot(self.body)
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = chat.save_markdown(Path(tmp))
+            self.assertEqual(md_path.name, "fibonacci-helper-and-a-quick-search-3f2b9c1e.md")
+            self.assertEqual(md_path.parent, Path(tmp))
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_fetch_claude_snapshot_requests_api_endpoint(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = self.body
+        self.assertEqual(fetch_claude_snapshot(CLAUDE_SHARE_URL, attempts=2), self.body)
+        args, kwargs = mock_fetch.call_args
+        self.assertEqual(
+            args[0],
+            "https://claude.ai/api/chat_snapshots/3f2b9c1e-8d4a-4e6f-9b7c-1a2d3e4f5a6b"
+            "?rendering_mode=messages&render_all_tools=true",
+        )
+        self.assertEqual(kwargs["headers"]["Accept"], "application/json")
+        self.assertEqual(kwargs["headers"]["Referer"], CLAUDE_SHARE_URL)
+        self.assertEqual(kwargs["attempts"], 2)
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_fetch_claude_snapshot_maps_403_and_404(self, mock_fetch: mock.Mock) -> None:
+        for status, phrase in ((403, "HTTP 403"), (404, "HTTP 404")):
+            mock_fetch.side_effect = self._http_error(status)
+            with self.assertRaises(ShareAccessError) as ctx:
+                fetch_claude_snapshot(CLAUDE_SHARE_URL)
+            self.assertIn(phrase, str(ctx.exception))
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_fetch_claude_snapshot_reraises_other_errors(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.side_effect = self._http_error(500)
+        with self.assertRaises(requests.HTTPError):
+            fetch_claude_snapshot(CLAUDE_SHARE_URL)
+
+    def test_fetch_claude_snapshot_rejects_non_claude_link(self) -> None:
+        with self.assertRaises(ValueError):
+            fetch_claude_snapshot("https://chatgpt.com/share/abc")
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_load_share_routes_by_host(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = self.body
+        self.assertEqual(load_share(CLAUDE_SHARE_URL).source, "Claude")
+        mock_fetch.return_value = SHARE_FIXTURE.read_text(encoding="utf-8")
+        self.assertEqual(
+            load_share("https://chatgpt.com/share/690781ed-75f0-8006-9d6e-d9229bd932f2").source,
+            "ChatGPT",
+        )
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_chatpeek_facade_accepts_claude_link(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = self.body
+        self.assertEqual(ChatPeek(CLAUDE_SHARE_URL).chat.title, "Fibonacci helper and a quick search")
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_main_exports_claude_link(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.return_value = self.body
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
+            main([CLAUDE_SHARE_URL, "--output", tmp])
+            written = Path(out.getvalue().strip())
+            self.assertTrue(written.exists())
+            self.assertIn("**Artifact: fib.py**", written.read_text(encoding="utf-8"))
+
+    @mock.patch("ChatPeek.fetch_share_page")
+    def test_main_reports_claude_access_error(self, mock_fetch: mock.Mock) -> None:
+        mock_fetch.side_effect = self._http_error(403)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                main([CLAUDE_SHARE_URL])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("claude.ai refused", err.getvalue())
 
 
 if __name__ == "__main__":
