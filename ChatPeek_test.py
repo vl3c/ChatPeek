@@ -2362,6 +2362,16 @@ class ClaudeShareTests(unittest.TestCase):
             self.assertIn(phrase, str(ctx.exception))
 
     @mock.patch("ChatPeek.fetch_share_page")
+    def test_fetch_claude_snapshot_names_bot_challenge(self, mock_fetch: mock.Mock) -> None:
+        error = self._http_error(403)
+        assert error.response is not None
+        error.response.headers = {"cf-mitigated": "challenge"}
+        mock_fetch.side_effect = error
+        with self.assertRaises(ShareAccessError) as ctx:
+            fetch_claude_snapshot(CLAUDE_SHARE_URL)
+        self.assertIn("bot protection challenged", str(ctx.exception))
+
+    @mock.patch("ChatPeek.fetch_share_page")
     def test_fetch_claude_snapshot_reraises_other_errors(self, mock_fetch: mock.Mock) -> None:
         mock_fetch.side_effect = self._http_error(500)
         with self.assertRaises(requests.HTTPError):

@@ -1075,6 +1075,12 @@ def fetch_claude_snapshot(
         )
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
+        headers = getattr(exc.response, "headers", None) or {}
+        if status == 403 and headers.get("cf-mitigated") == "challenge":
+            raise ShareAccessError(
+                "claude.ai's bot protection challenged the request (HTTP 403). This is "
+                "common from cloud servers and VPNs; retry from a home connection."
+            ) from exc
         if status == 403:
             raise ShareAccessError(
                 "claude.ai refused the request (HTTP 403). Either the link is no longer "
